@@ -238,6 +238,6 @@ This app is licensed under the Apache License 2.0.
 | Audience | analyst, admin, builder |
 | Availability | preview |
 | Requires External Access | no |
-| Repository | https://github.com/werd-drew/cc-visicore-spl-to-kql |
+| Repository | https://github.com/Cribl-Community/cc-visicore-spl-to-kql |
 | Documentation | this README |
 | README Schema Version | 1.0 |
