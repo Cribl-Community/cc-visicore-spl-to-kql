@@ -2,6 +2,8 @@
 
 Translate Splunk Search Processing Language (SPL) into Cribl Search KQL, with a stage-by-stage explanation of what changed, what was approximated, and what still needs a human.
 
+![SPL to KQL app: Splunk SPL on the left, the translated Cribl Search KQL on the right with approximation and dataset-validation tags, index-to-dataset mapping, and the Notes tab explaining each stage](images/spl-to-kql-app.png)
+
 ## Summary
 
 SPL to KQL is a Cribl app for teams moving searches, alerts and dashboards from Splunk to Cribl Search. It helps users translate SPL pipelines into runnable KQL, understand every approximation the translation made, and verify the result against their own Cribl tenant without leaving the app.
@@ -163,6 +165,7 @@ src/
   components/             Notes, Stages, Results, Reference, History panels
   data/                   KQL catalog snapshot and cheat sheet
   examples.ts             sample SPL queries
+images/                   README screenshots
 scripts/
   translate.ts            CLI
   package.mjs             app packaging
