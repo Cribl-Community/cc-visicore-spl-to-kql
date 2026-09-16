@@ -326,6 +326,8 @@ export interface UserPrefs {
   /** Splunk index → Cribl dataset overrides. */
   indexMap?: Record<string, string>;
   filtersAsWhere?: boolean;
+  /** Apply Splunk search-time field stages from the loaded knowledge (default on). */
+  applyShim?: boolean;
   earliest?: string;
   latest?: string;
 }
@@ -338,6 +340,21 @@ export async function loadPrefs(userId: string): Promise<UserPrefs> {
 
 export async function savePrefs(userId: string, prefs: UserPrefs): Promise<void> {
   await kvSave(prefsKey(userId), prefs);
+}
+
+const knowledgeKey = (userId: string) => `users/${encodeURIComponent(userId)}/knowledge`;
+
+/** Splunk knowledge bundle (props/transforms/eventtypes/tags/data models) saved per user. */
+export async function loadKnowledge<T>(userId: string): Promise<T | null> {
+  return kvLoad<T>(knowledgeKey(userId));
+}
+
+export async function saveKnowledge(userId: string, knowledge: unknown | null): Promise<void> {
+  if (knowledge === null) {
+    await request('DELETE', `/kvstore/${knowledgeKey(userId)}`, { ok404: true });
+    return;
+  }
+  await kvSave(knowledgeKey(userId), knowledge);
 }
 
 /** Current user id, or "anonymous" when running outside Cribl. */

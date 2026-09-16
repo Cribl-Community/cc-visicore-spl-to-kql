@@ -18,6 +18,7 @@ SPL to KQL is a Cribl app for teams moving searches, alerts and dashboards from 
   * Checks the generated query with Cribl's own parser (the Search preview endpoint), without running a search.
   * Runs the query as a real search job from the app and shows results, or saves it as a Cribl Search saved search.
   * Maps Splunk index names to the Cribl datasets that hold the same data, per user.
+  * Reproduces Splunk search-time fields and CIM normalization in Cribl: load your TAs and the CIM app (packages, .conf files or a knowledge bundle) and the translator emits the extractions, field aliases, calculated fields and lookups for each sourcetype, expands `tag=`/`eventtype=` and macros, and translates `tstats ... from datamodel=`, `| datamodel` and `| from datamodel:`.
   * Built-in reference: an SPL to KQL cheat sheet and the operator/function catalog loaded from your tenant.
   * Per-user conversion history, kept in the app KV store.
 * Intended users:
@@ -59,6 +60,7 @@ SPL to KQL is a Cribl app for teams moving searches, alerts and dashboards from 
 
 | Setting | Required | Description | Example | Scope |
 |---|---|---|---|---|
+| Splunk knowledge | No | Add-on packages, .conf files, data model JSON or a knowledge.json bundle; enables search-time field reproduction and data model translation. | `Splunk_SA_CIM.tgz`, `TA-apache.tgz` | per-user |
 | Splunk index → Cribl dataset | No | Per-index override used when the Splunk index name differs from the Cribl dataset id. Shown for every `index=` the SPL references. | `main` → `default_logs` | per-user |
 | Default dataset | No | Dataset used when the SPL has no `index=` clause. When unset the output contains `dataset="<DATASET>"` and an error note. | `default_logs` | per-user |
 | Emit first-stage filters as a where stage | No | Off (default) keeps Splunk-style filters in Cribl's initial stage, which is pushed down to the dataset provider. On moves them to a `where` stage. | off | per-user |
@@ -80,6 +82,32 @@ All settings are saved in the app KV store per user and restored on the next vis
 * Confirm the status tag in the header shows your datasets, lookups and macros were loaded.
 * Set a default dataset if your SPL library relies on a default index.
 * Try the “Unsupported commands” example to see how untranslatable stages are reported.
+
+## Splunk Knowledge And CIM
+
+Splunk fields such as `src`, `action` or `Web.status` exist only because add-ons define search-time extractions, aliases, calculated fields, lookups, eventtypes and tags. The **Splunk knowledge** tab loads those definitions so the translation reproduces them in Cribl Search.
+
+What to load:
+
+* Add-on packages (`.tgz`/`.spl`) or their `props.conf`, `transforms.conf`, `eventtypes.conf`, `tags.conf`, `macros.conf` files.
+* The Common Information Model app (`Splunk_SA_CIM`) for data model definitions (`default/data/models/*.json`), or individual model JSON files.
+* A `knowledge.json` bundle built from a Splunk install: `npm run knowledge -- $SPLUNK_HOME/etc/system $SPLUNK_HOME/etc/apps/Splunk_SA_CIM $SPLUNK_HOME/etc/apps/<TA> --out knowledge.json`.
+
+What the translator does with it, in Splunk's search-time order:
+
+| Splunk knowledge object | Emitted KQL |
+|---|---|
+| `EXTRACT-x = (?<f>...)` and `REPORT-x` transforms (`REGEX`, `FORMAT`, `[[macro]]` references) | `extract type=regex regex=@"..."` (PCRE possessive/atomic syntax rewritten; lookarounds and backreferences are flagged) |
+| `DELIMS`/`FIELDS` transforms | `extract type=delim delimiter="," "a,b,c"` |
+| `FIELDALIAS-x = a AS b` / `ASNEW` | `extend b = a` / `extend b = coalesce(b, a)` |
+| `EVAL-f = expr` | `extend f = <translated expr>` |
+| `LOOKUP-x = def field OUTPUT ...` (with `match_type = CIDR(...)`) | `lookup [matchMode=cidr] output="..." file on field` |
+| `tag=web`, `eventtype=x`, `` `macro` `` | expanded to the eventtype searches (index= terms become the dataset scope) |
+| `tstats ... from datamodel=Web.Web`, `\| datamodel Web Web search`, `\| from datamodel:"Web.Web"` | dataset scope from the object's constraints, sourcetype field stages, the model's calculated fields, then the aggregation with `Web.` prefixes stripped |
+
+Filters on extracted fields are moved after the field stages so the fields exist when they are evaluated. Lookups referenced by the knowledge must exist in Cribl Search as lookup files (the app validates their names).
+
+Verified end to end: identical Apache access logs were loaded into Splunk (`sourcetype=access_combined`, with `Splunk_SA_CIM` and a CIM web TA installed) and into Cribl Search, and 26 CIM-normalized queries (`stats by src, action, status_description`, `tag=web`, `eventtype=`, `tstats from datamodel=Web.Web ...`, `| datamodel`, `| from datamodel:`) returned identical results in both.
 
 ## Permissions
 
@@ -110,13 +138,13 @@ This app makes no external calls. `config/proxies.yml` declares no domains.
 
 ## Data And Storage
 
-* KV keys: `users/<userId>/history` (last 50 conversions) and `users/<userId>/prefs` (default dataset, filter mode, time range).
+* KV keys: `users/<userId>/history` (last 50 conversions), `users/<userId>/prefs` (default dataset, index mapping, filter mode, time range) and `users/<userId>/knowledge` (the loaded Splunk knowledge bundle).
 * Data is persisted per user and is not shared across users.
 * Running a query creates a search job in Cribl Search like any other search. Saving creates a saved search. `outputlookup` translations become `export to lookup`, which writes a lookup when the query runs; the app flags this with a warning.
 
 ## Known Limitations
 
-* Translation is syntactic and deterministic. Field semantics (extractions, data models, event types, tags) are Splunk-side knowledge the translator does not have; `datamodel`, `tstats FROM datamodel`, `typer` and `tags` are reported as unsupported.
+* Translation is deterministic. Without loaded Splunk knowledge, field names pass through unchanged and data models, `tag=` and `eventtype=` cannot be resolved. With it, extractions that need PCRE-only regex features (lookarounds, backreferences), `FORMAT = $1::$2` key-value transforms, KV-store lookups, WILDCARD lookups and GeoIP calculations are reported rather than translated. Splunk `EXTRACT ... in <field>` runs before `REPORT` extractions, in both systems.
 * Commands with no Cribl equivalent (`transaction`, `transpose`, `untable`, `appendcols`, `map`, `foreach`, `return`, `format`, `mvcombine`, most ML commands) are emitted as `// TODO` comments with an error note.
 * Some semantics differ and are flagged as notes: `dedup` works within a time window in Cribl; `coalesce()`/`fillnull` also replace empty strings; `strcat()` treats missing fields as empty (Splunk's `.` yields null); `first()`/`last()` map to `findlatest()`/`findearliest()`; `timestats` omits empty buckets and needs the `@` snap suffix to align buckets to the clock; `stats ... by` gets a `where isnotnull()` stage because Cribl keeps a null group.
 * Regular expressions: `rex`, `extract` and `replace_regex` use RE2 (no lookarounds); `matches regex` uses ECMAScript regex literals.
@@ -147,6 +175,7 @@ npm install
 npm run dev        # live preview (open from Cribl's app dev page for API access)
 npm test           # translator unit tests (vitest)
 npm run translate -- 'index=web | stats count by host'   # CLI translation
+npm run knowledge -- $SPLUNK_HOME/etc/system $SPLUNK_HOME/etc/apps/Splunk_SA_CIM --out knowledge.json   # Splunk knowledge bundle
 npm run package    # build and create the .tgz app package
 ```
 
@@ -160,6 +189,7 @@ npm run package    # build and create the .tgz app package
 ```text
 src/
   App.tsx                 main UI
+  knowledge/              Splunk knowledge: conf parsers, PCRE→RE2 regex conversion, sourcetype shim, data models, package reader
   api.ts                  Cribl REST calls (datasets, lookups, macros, docs, preview, jobs, saved searches, KV)
   translator/             SPL → KQL translator (lexer, expressions, search scope, commands, entry point)
   components/             Notes, Stages, Results, Reference, History panels
@@ -167,7 +197,8 @@ src/
   examples.ts             sample SPL queries
 images/                   README screenshots
 scripts/
-  translate.ts            CLI
+  translate.ts            CLI (--knowledge knowledge.json)
+  knowledge-from-dir.ts   build a knowledge bundle from Splunk app folders
   package.mjs             app packaging
 tests/                    vitest suites
 config/
@@ -195,7 +226,7 @@ This app is licensed under the Apache License 2.0.
 |---|---|
 | App Name | SPL to KQL |
 | App ID | cc-visicore-spl-to-kql |
-| Version | 1.0.0 |
+| Version | 1.1.0 |
 | Author | VisiCore (Andrew Hendrix) |
 | Support Model | community-built |
 | Support Label | Community Built |

@@ -251,8 +251,20 @@ export function kqlRegexLiteral(pattern: string, flags = ''): string {
 }
 
 /** Render a field reference, resolving aggregation aliases and quoting where needed. */
+/** Strip a data model object prefix (`Web.status` → `status`) when the object is in scope. */
+export function stripDmPrefix(name: string, ctx: Ctx): string {
+  if (!ctx.dmPrefixes.size) return name;
+  let n = name;
+  for (let i = 0; i < 3; i++) {
+    const dot = n.indexOf('.');
+    if (dot <= 0 || !ctx.dmPrefixes.has(n.slice(0, dot))) break;
+    n = n.slice(dot + 1);
+  }
+  return n;
+}
+
 export function fieldRef(name: string, ctx: Ctx): string {
-  const resolved = ctx.fieldAliases.get(name) ?? name;
+  const resolved = stripDmPrefix(ctx.fieldAliases.get(name) ?? name, ctx);
   if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(resolved) && !RESERVED.has(resolved.toLowerCase())) return resolved;
   // Dotted names are nested-path access in Cribl (JSON is auto-parsed), keep them bare.
   if (/^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)+$/.test(resolved)) return resolved;

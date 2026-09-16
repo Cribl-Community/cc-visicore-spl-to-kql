@@ -400,3 +400,60 @@ body {
   border-radius: token('radius.md');
   background-color: token('color.background.neutral.subtle');
 }
+
+/* Knowledge */
+.knowledge {
+  display: flex;
+  flex-direction: column;
+  gap: token('spacing.md');
+}
+
+.knowledge-toolbar {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: token('spacing.lg');
+}
+
+.knowledge-toolbar p {
+  margin-top: token('spacing.xs');
+}
+
+.knowledge-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: token('spacing.lg');
+}
+
+@media (max-width: 960px) {
+  .knowledge-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.knowledge-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: token('spacing.xs');
+  margin-top: token('spacing.xs');
+  margin-bottom: token('spacing.md');
+  max-height: 320px;
+  overflow: auto;
+  font-size: token('core.fontSize.xs');
+}
+
+.knowledge-list code,
+.knowledge code {
+  font-family: token('core.fontFamily.mono');
+}
+
+/* Keep the file input reachable by assistive tech while the Button triggers it. */
+.visually-hidden-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  overflow: hidden;
+  pointer-events: none;
+}

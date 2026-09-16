@@ -1,3 +1,5 @@
+import type { Knowledge } from '../knowledge/types';
+
 /**
  * Shared types for the SPL → Cribl Search KQL translator.
  *
@@ -45,6 +47,8 @@ export interface TranslationResult {
   datasets: string[];
   /** Splunk index names as written in the SPL. */
   indexes: string[];
+  /** Sourcetypes referenced by the scope (after tag/eventtype expansion). */
+  sourcetypes: string[];
   /** Lookup table names referenced. */
   lookups: string[];
   /** Macro names referenced. */
@@ -71,8 +75,12 @@ export interface TranslateOptions {
    * preview endpoint, which ignores scope predicates, evaluate them.
    */
   filtersAsWhere?: boolean;
-  /** Splunk index name → Cribl dataset id overrides (e.g. { main: "default_logs" }). */
+  /** Splunk index (or sourcetype) name → Cribl dataset id overrides (e.g. { main: "default_logs" }). */
   indexMap?: Record<string, string>;
+  /** Splunk knowledge objects (props/transforms, eventtypes, tags, data models) used to reproduce search-time fields. */
+  knowledge?: Knowledge;
+  /** Emit search-time field stages for sourcetypes found in the knowledge (default true when knowledge is set). */
+  applyShim?: boolean;
 }
 
 /** Mutable state threaded through the translation of one query. */
@@ -90,6 +98,10 @@ export interface Ctx {
   indexes: Set<string>;
   lookups: Set<string>;
   macros: Set<string>;
+  /** Sourcetypes referenced by the scope (after tag/eventtype expansion). */
+  sourcetypes: Set<string>;
+  /** Data model object names whose `Object.field` prefix is stripped from field references. */
+  dmPrefixes: Set<string>;
   timeRange: TimeRange;
   /** True while translating a subsearch (append/join/union); subqueries need the explicit `cribl` keyword. */
   inSubsearch: boolean;
@@ -107,6 +119,8 @@ export function createCtx(opts: TranslateOptions, inSubsearch = false): Ctx {
     indexes: new Set(),
     lookups: new Set(),
     macros: new Set(),
+    sourcetypes: new Set(),
+    dmPrefixes: new Set(),
     timeRange: {},
     inSubsearch,
     note(level, message) {

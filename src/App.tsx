@@ -10,9 +10,11 @@ import {
   listLookups,
   listMacros,
   loadHistory,
+  loadKnowledge,
   loadPrefs,
   runQuery,
   saveHistory,
+  saveKnowledge,
   savePrefs,
   saveSearch,
   savedSearchExists,
@@ -31,8 +33,10 @@ import { StagesPanel } from './components/StagesPanel';
 import { ResultsPanel } from './components/ResultsPanel';
 import { ReferencePanel } from './components/ReferencePanel';
 import { HistoryPanel } from './components/HistoryPanel';
+import { KnowledgePanel } from './components/KnowledgePanel';
+import type { Knowledge } from './knowledge/types';
 
-type Tab = 'notes' | 'stages' | 'results' | 'reference' | 'history';
+type Tab = 'notes' | 'stages' | 'results' | 'reference' | 'knowledge' | 'history';
 
 interface EnvState {
   loading: boolean;
@@ -84,6 +88,8 @@ function App() {
   // `kql` records which query the check belongs to, so a changed query shows as unchecked without an effect.
   const [syntaxState, setSyntax] = useState<{ kql: string; state: 'idle' | 'checking' | 'done'; result?: SyntaxCheck; error?: string }>({ kql: '', state: 'idle' });
   const [history, setHistory] = useState<HistoryEntry[]>([]);
+  const [knowledge, setKnowledge] = useState<Knowledge | null>(null);
+  const [knowledgeError, setKnowledgeError] = useState<string | null>(null);
 
   // Run modal
   const [runOpen, setRunOpen] = useState(false);
@@ -131,9 +137,14 @@ function App() {
       const id = await currentUserId();
       if (cancelled) return;
       setUserId(id);
-      const [p, h] = await Promise.all([loadPrefs(id).catch(() => ({}) as UserPrefs), loadHistory(id).catch(() => [] as HistoryEntry[])]);
+      const [p, h, kn] = await Promise.all([
+        loadPrefs(id).catch(() => ({}) as UserPrefs),
+        loadHistory(id).catch(() => [] as HistoryEntry[]),
+        loadKnowledge<Knowledge>(id).catch(() => null),
+      ]);
       if (cancelled) return;
       setPrefs(p);
+      if (kn) setKnowledge(kn);
       if (p.earliest) setRunEarliest(p.earliest);
       if (p.latest) setRunLatest(p.latest);
       setHistory(h);
@@ -164,11 +175,13 @@ function App() {
         defaultDataset: prefs.defaultDataset || undefined,
         filtersAsWhere: !!prefs.filtersAsWhere,
         indexMap: prefs.indexMap,
+        knowledge: knowledge ?? undefined,
+        applyShim: prefs.applyShim !== false,
         knownDatasets: env.datasets.length ? env.datasets.map((d) => d.id) : undefined,
         knownLookups: env.lookups.length ? env.lookups : undefined,
         knownMacros: env.macros.length ? env.macros : undefined,
       }),
-    [debouncedSpl, prefs.defaultDataset, prefs.filtersAsWhere, prefs.indexMap, env.datasets, env.lookups, env.macros],
+    [debouncedSpl, prefs.defaultDataset, prefs.filtersAsWhere, prefs.indexMap, prefs.applyShim, knowledge, env.datasets, env.lookups, env.macros],
   );
 
   const syntax = syntaxState.kql === result.kql ? syntaxState : { kql: result.kql, state: 'idle' as const };
@@ -199,6 +212,16 @@ function App() {
     setHistory([]);
     if (live) void saveHistory(userId, []).catch(() => undefined);
   }, [live, userId]);
+
+  const changeKnowledge = useCallback(
+    (k: Knowledge | null) => {
+      setKnowledge(k);
+      setKnowledgeError(null);
+      if (!live) return;
+      saveKnowledge(userId, k).catch((e: Error) => setKnowledgeError(`Could not save to the app KV store (${e.message}). Reload the files next time you open the app.`));
+    },
+    [live, userId],
+  );
 
   /* ---------------- actions ---------------- */
   const doCopy = async () => {
@@ -304,6 +327,7 @@ function App() {
     { key: 'stages', text: `Stages${result.stages.length ? ` (${result.stages.length})` : ''}` },
     { key: 'results', text: results ? `Results (${results.rows.length})` : 'Results' },
     { key: 'reference', text: 'Reference', icon: BookOutlined },
+    { key: 'knowledge', text: knowledge ? `Splunk knowledge (${Object.keys(knowledge.props).length} st)` : 'Splunk knowledge' },
     { key: 'history', text: `History${history.length ? ` (${history.length})` : ''}`, icon: HistoryOutlined },
   ];
 
@@ -358,13 +382,13 @@ function App() {
             </div>
           </div>
           <TextArea aria-label="Splunk SPL query" value={spl} onChange={setSpl} autoSize={{ minRows: 10, maxRows: 26 }} spellCheck={false} placeholder="index=web status>=500 | stats count by host" appearance="default" />
-          {live && result.indexes.length > 0 && (
+          {live && (result.indexes.length > 0 || (result.indexes.length === 0 && result.sourcetypes.length > 0)) && (
             <div className="index-map">
-              <Text variant="body-sm-semibold">Splunk index → Cribl dataset</Text>
-              {result.indexes.map((ix) => (
+              <Text variant="body-sm-semibold">{result.indexes.length ? 'Splunk index → Cribl dataset' : 'Splunk sourcetype → Cribl dataset'}</Text>
+              {(result.indexes.length ? result.indexes : result.sourcetypes).map((ix) => (
                 <SelectField
                   key={ix}
-                  label={`index=${ix}`}
+                  label={result.indexes.length ? `index=${ix}` : `sourcetype=${ix}`}
                   layout="horizontal"
                   size="sm"
                   items={mapItems}
@@ -486,6 +510,16 @@ function App() {
           {tab === 'stages' && <StagesPanel stages={result.stages} notes={result.notes} />}
           {tab === 'results' && <ResultsPanel job={job} results={results} error={runError} running={running} />}
           {tab === 'reference' && <ReferencePanel live={env.docs} liveError={env.docsError} />}
+          {tab === 'knowledge' && (
+            <KnowledgePanel
+              knowledge={knowledge}
+              onChange={changeKnowledge}
+              applyShim={prefs.applyShim !== false}
+              onApplyShimChange={(v) => updatePrefs({ applyShim: v })}
+              sourcetypes={result.sourcetypes}
+              persistError={knowledgeError}
+            />
+          )}
           {tab === 'history' && <HistoryPanel entries={history} onLoad={loadHistoryEntry} onClear={clearHistory} available={live} />}
         </div>
       </section>

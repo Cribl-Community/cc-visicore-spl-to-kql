@@ -69,6 +69,7 @@ function translateSub(spl: string, parent: Ctx): string {
   for (const n of ctx.notes) parent.notes.push({ ...n, stage: parent.stage, command: parent.command, message: `[subsearch] ${n.message}` });
   ctx.datasets.forEach((d) => parent.datasets.add(d));
   ctx.indexes.forEach((d) => parent.indexes.add(d));
+  ctx.sourcetypes.forEach((d) => parent.sourcetypes.add(d));
   ctx.lookups.forEach((d) => parent.lookups.add(d));
   ctx.macros.forEach((d) => parent.macros.add(d));
   return lines.join(' | ');
@@ -81,7 +82,7 @@ export function translate(spl: string, opts: TranslateOptions = {}): Translation
   const lines: string[] = [];
 
   if (stages.length === 0) {
-    return { kql: '', stages: [], notes: [], timeRange: {}, datasets: [], indexes: [], lookups: [], macros: [], unsupportedCount: 0 };
+    return { kql: '', stages: [], notes: [], timeRange: {}, datasets: [], indexes: [], sourcetypes: [], lookups: [], macros: [], unsupportedCount: 0 };
   }
 
   stages.forEach((st, i) => {
@@ -113,6 +114,7 @@ export function translate(spl: string, opts: TranslateOptions = {}): Translation
     timeRange: ctx.timeRange,
     datasets: [...ctx.datasets],
     indexes: [...ctx.indexes],
+    sourcetypes: [...ctx.sourcetypes],
     lookups: [...ctx.lookups],
     macros: [...ctx.macros],
     unsupportedCount: results.filter((r) => r.unsupported).length,

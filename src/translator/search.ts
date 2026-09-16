@@ -7,7 +7,7 @@
  *  - `renderWhere`  → a `where` predicate for mid-pipeline `search` stages.
  */
 import { tokenize, type Tok } from './lexer';
-import { fieldRef, globToRegex, kqlRegexLiteral, kqlString } from './expr';
+import { fieldRef, globToRegex, kqlRegexLiteral, kqlString, stripDmPrefix } from './expr';
 import type { Ctx, TimeRange } from './types';
 
 export type SAst =
@@ -161,11 +161,54 @@ function isIndexOnlyOr(a: SAst): string[] | null {
   return null;
 }
 
-/** Pull index= and time modifiers out of the top-level AND chain. */
-export function extractScope(ast: SAst, ctx: Ctx): ScopeInfo {
+const globRe = (g: string) => new RegExp('^' + g.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*') + '$', 'i');
+
+/** Remove index= terms nested anywhere in an AST (used for tag/eventtype expansions). */
+function stripIndexes(a: SAst, out: string[]): SAst {
+  const idx = isIndexOnlyOr(a);
+  if (idx) {
+    out.push(...idx);
+    return { k: 'all' };
+  }
+  if (a.k === 'and') {
+    const l = stripIndexes(a.l, out);
+    const r = stripIndexes(a.r, out);
+    if (l.k === 'all') return r;
+    if (r.k === 'all') return l;
+    return { k: 'and', l, r };
+  }
+  if (a.k === 'or') return { k: 'or', l: stripIndexes(a.l, out), r: stripIndexes(a.r, out) };
+  return a;
+}
+
+/** Collect sourcetype=value terms anywhere in the predicate. */
+export function collectSourcetypes(a: SAst, out: Set<string>): void {
+  if (a.k === 'cmp' && a.field.toLowerCase() === 'sourcetype' && a.op === '=') out.add(a.value);
+  else if (a.k === 'and' || a.k === 'or') {
+    collectSourcetypes(a.l, out);
+    collectSourcetypes(a.r, out);
+  } else if (a.k === 'not') collectSourcetypes(a.e, out);
+}
+
+/** Pull index= and time modifiers out of the top-level AND chain; expand tags, eventtypes and known macros. */
+export function extractScope(ast: SAst, ctx: Ctx, depth = 0): ScopeInfo {
   const datasets: string[] = [];
   const timeRange: TimeRange = {};
   const keep: SAst[] = [];
+  const k = ctx.opts.knowledge;
+  const expandSearches = (searches: string[], label: string) => {
+    const branches = searches.map((s) => extractScope(parseSearch(s), ctx, depth + 1));
+    for (const b of branches) datasets.push(...b.datasets);
+    const rests = branches.map((b) => b.rest).filter((r) => r.k !== 'all');
+    if (!rests.length) return;
+    let or: SAst = rests[0];
+    for (const r of rests.slice(1)) or = { k: 'or', l: or, r };
+    const stripped: string[] = [];
+    const cleaned = stripIndexes(or, stripped);
+    datasets.push(...stripped);
+    if (cleaned.k !== 'all') keep.push(cleaned);
+    ctx.note('info', `${label} was expanded to its eventtype search(es).`);
+  };
   const visit = (a: SAst) => {
     if (a.k === 'and') {
       visit(a.l);
@@ -175,6 +218,39 @@ export function extractScope(ast: SAst, ctx: Ctx): ScopeInfo {
     const idx = isIndexOnlyOr(a);
     if (idx) {
       datasets.push(...idx);
+      return;
+    }
+    if (k && depth < 6 && a.k === 'cmp' && a.op === '=' && a.field.toLowerCase() === 'tag') {
+      const ets = k.eventtypes.filter((e) => e.search && e.tags.some((t) => t.toLowerCase() === a.value.toLowerCase()));
+      if (!ets.length) {
+        ctx.note('warning', `tag=${a.value}: no eventtype in the loaded Splunk knowledge carries this tag; the term was dropped.`);
+        return;
+      }
+      expandSearches(ets.map((e) => e.search), `tag=${a.value} (${ets.map((e) => e.name).join(', ')})`);
+      return;
+    }
+    if (k && depth < 6 && a.k === 'cmp' && a.op === '=' && a.field.toLowerCase() === 'eventtype') {
+      const re = globRe(a.value);
+      const ets = k.eventtypes.filter((e) => e.search && re.test(e.name));
+      if (!ets.length) {
+        ctx.note('warning', `eventtype=${a.value}: not found in the loaded Splunk knowledge; the term was dropped.`);
+        return;
+      }
+      expandSearches(ets.map((e) => e.search), `eventtype=${a.value}`);
+      return;
+    }
+    if (a.k === 'macro') {
+      const name = a.v.replace(/\(.*$/, '');
+      const def = k?.macros?.[name];
+      if (def !== undefined && depth < 6 && !a.v.includes('(')) {
+        const inner = extractScope(parseSearch(def), ctx, depth + 1);
+        datasets.push(...inner.datasets);
+        if (inner.rest.k !== 'all') keep.push(inner.rest);
+        return;
+      }
+    }
+    if (a.k === 'cmp' && a.field.toLowerCase() === 'nodename') {
+      ctx.note('info', 'nodename= (data model object filter) has no Cribl equivalent and was dropped.');
       return;
     }
     if (a.k === 'cmp' && TIME_FIELDS.has(a.field.toLowerCase())) {
@@ -209,8 +285,9 @@ function scopeValue(v: string, quoted: boolean): string {
   return kqlString(v);
 }
 
-function scopeField(f: string): string {
-  return /^[A-Za-z_][A-Za-z0-9_.]*$/.test(f) ? f : '["' + f.replace(/"/g, '\\"') + '"]';
+function scopeField(f: string, ctx: Ctx): string {
+  const n = stripDmPrefix(f, ctx);
+  return /^[A-Za-z_][A-Za-z0-9_.]*$/.test(n) ? n : '["' + n.replace(/"/g, '\\"') + '"]';
 }
 
 /** Render a predicate for Cribl's initial (implicit `cribl`) stage. */
@@ -219,9 +296,9 @@ export function renderScope(ast: SAst, ctx: Ctx): string {
     case 'all':
       return '';
     case 'cmp':
-      return `${scopeField(ast.field)}${ast.op}${scopeValue(ast.value, ast.quoted)}`;
+      return `${scopeField(ast.field, ctx)}${ast.op}${scopeValue(ast.value, ast.quoted)}`;
     case 'in':
-      return `${scopeField(ast.field)} IN (${ast.values.map((v) => scopeValue(v.v, v.quoted)).join(', ')})`;
+      return `${scopeField(ast.field, ctx)} IN (${ast.values.map((v) => scopeValue(v.v, v.quoted)).join(', ')})`;
     case 'text':
       return ast.quoted || !/^[A-Za-z0-9_*.:-]+$/.test(ast.v) ? kqlString(ast.v) : ast.v;
     case 'and': {
@@ -330,6 +407,45 @@ export function renderWhere(ast: SAst, ctx: Ctx): string {
       return `\${${name}}`;
     }
   }
+}
+
+const META_FIELDS = new Set(['sourcetype', 'source', 'host', 'index', '_time', 'splunk_server', 'punct', 'linecount', 'timestamp']);
+
+function usesOnlyMeta(a: SAst): boolean {
+  switch (a.k) {
+    case 'all':
+    case 'text':
+    case 'macro':
+    case 'sub':
+      return true;
+    case 'cmp':
+      return META_FIELDS.has(a.field.toLowerCase());
+    case 'in':
+      return META_FIELDS.has(a.field.toLowerCase());
+    case 'not':
+      return usesOnlyMeta(a.e);
+    case 'and':
+    case 'or':
+      return usesOnlyMeta(a.l) && usesOnlyMeta(a.r);
+  }
+}
+
+/**
+ * Split a predicate into terms that only use index-time metadata (kept in the
+ * dataset scope) and terms on extracted fields (applied after the field stages).
+ */
+export function partitionPredicate(a: SAst): { scope: SAst; later: SAst } {
+  const scope: SAst[] = [];
+  const later: SAst[] = [];
+  const visit = (t: SAst) => {
+    if (t.k === 'and') {
+      visit(t.l);
+      visit(t.r);
+    } else if (t.k !== 'all') (usesOnlyMeta(t) ? scope : later).push(t);
+  };
+  visit(a);
+  const join = (xs: SAst[]): SAst => (xs.length ? xs.reduce((l, r) => ({ k: 'and', l, r })) : { k: 'all' });
+  return { scope: join(scope), later: join(later) };
 }
 
 /** True if the predicate contains anything besides `all`. */

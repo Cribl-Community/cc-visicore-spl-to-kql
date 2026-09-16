@@ -354,3 +354,23 @@ Remaining differences are semantic and documented in README → Known Limitation
 `GET /api/v1/m/default_search/search/docs`, keep `docs[]` entries of kind `operator`/`function`,
 map each to `{n, k, c (catalog label), d (shortDescription), s (first Syntax code block), u (docs url)}`.
 The app loads the live bundle at runtime and only falls back to the snapshot.
+
+## Splunk knowledge (CIM) module — `src/knowledge/`
+
+- `conf.ts` parses props/transforms/eventtypes/tags/macros .conf and data model JSON into `Knowledge`.
+- `regex.ts` expands `[[transform]]`/`[[transform:field]]` macros (field is the group name when the
+  transform has an unnamed `(?<>` group, otherwise a PREFIX for the transform's named groups) and rewrites
+  PCRE-only syntax for RE2.
+- `shim.ts` emits, per sourcetype and in Splunk order: `extract type=regex` per EXTRACT/REPORT regex
+  (the Cribl `extract` OPERATOR: all named groups become fields, unmatched groups are null, duplicate
+  group names are rejected so they are suffixed `_2`), `extend` for FIELDALIAS, `extend` for EVAL,
+  `lookup` for LOOKUP. `buildScope` in commands.ts inserts it after the dataset scope and moves any
+  predicate on non-metadata fields to a `where` after the shim.
+- `datamodel.ts` resolves `Model.Object` chains, joins constraint searches (root → leaf), emits
+  calculated fields (Eval/Rex/Lookup), and registers object names so `Web.status` → `status`.
+- Verified with `cim_diff.py` (session scratchpad): Splunk with Splunk_SA_CIM + `TA-spl2kql-web`
+  (both installed under `~/Documents/GitHub/splunk-dev-work/splunk/etc/apps`) vs Cribl over the
+  `spl2kql_web_events` lookup, 26 CIM queries identical. Splunk runs `EXTRACT ... in <field>` BEFORE
+  `REPORT`, so an EXTRACT that depends on a REPORT field yields nothing in Splunk too.
+- Browser upload of `.tgz/.spl` packages uses `archive.ts` (pako + minimal tar reader); tested with
+  `tests/fixtures/*.tgz`.

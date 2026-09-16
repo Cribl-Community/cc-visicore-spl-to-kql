@@ -10,7 +10,9 @@
  */
 import { parseArgs, splitTopLevel, tokenize, type Tok } from './lexer';
 import { fieldRef, globToRegex, kqlRegexLiteral, kqlString, kqlVerbatim, translateExpr, parseExpr, renderExpr, ExprError } from './expr';
-import { parseSearch, extractScope, renderScope, renderWhere, isEmptyPredicate } from './search';
+import { type SAst, parseSearch, extractScope, renderScope, renderWhere, isEmptyPredicate, collectSourcetypes, partitionPredicate } from './search';
+import { buildShim, matchSourcetypes } from '../knowledge/shim';
+import { calculationStages, constraintSearch, objectPrefixes, resolveDataModel } from '../knowledge/datamodel';
 import { parseSpan, spanToTimespan, spanToTimestats } from './time';
 import type { Ctx } from './types';
 
@@ -83,7 +85,10 @@ function sanitizeName(s: string): string {
 /* Scope (first stage)                                                 */
 /* ------------------------------------------------------------------ */
 
-/** Build the dataset scope stage (plus an optional where stage) from an SPL search expression. */
+/** SPL `lookup` spec → KQL stages, for the knowledge shim. */
+const lookupToKql = (spec: string, ctx: Ctx): string[] => COMMANDS.lookup(spec, ctx, { sub: () => '', first: false }).kql;
+
+/** Build the dataset scope stage (plus optional where/shim stages) from an SPL search expression. */
 export function buildScope(raw: string, ctx: Ctx): string[] {
   const ast = parseSearch(raw);
   const { datasets, timeRange, rest } = extractScope(ast, ctx);
@@ -95,9 +100,20 @@ export function buildScope(raw: string, ctx: Ctx): string[] {
       ctx.note('info', `Time range earliest=${timeRange.earliest ?? '(unset)'} latest=${timeRange.latest ?? 'now'} was moved out of the query; set it on the Cribl Search time picker (same relative syntax).`);
     }
   }
+  // Sourcetypes referenced (directly or via tag/eventtype expansion) drive the knowledge shim and dataset fallback.
+  const stSet = new Set<string>();
+  collectSourcetypes(rest, stSet);
+  const k = ctx.opts.knowledge;
+  const sourcetypes = k ? [...stSet].flatMap((st) => matchSourcetypes(st, k)) : [...stSet];
+  for (const st of sourcetypes) ctx.sourcetypes.add(st);
+
   let scope: string;
   if (datasets.length === 0) {
-    if (ctx.opts.defaultDataset) {
+    const viaSt = [...stSet].map((st) => ctx.opts.indexMap?.[st]).find(Boolean);
+    if (viaSt) {
+      scope = `dataset=${kqlString(viaSt)}`;
+      ctx.note('info', `No index= in the SPL; using dataset "${viaSt}" mapped from the sourcetype.`);
+    } else if (ctx.opts.defaultDataset) {
       scope = `dataset=${kqlString(ctx.opts.defaultDataset)}`;
       ctx.note('info', `No index= in the SPL; using the default dataset "${ctx.opts.defaultDataset}".`);
     } else {
@@ -105,7 +121,7 @@ export function buildScope(raw: string, ctx: Ctx): string[] {
       ctx.note('error', 'No index= in the SPL. Cribl Search requires a dataset scope: replace <DATASET> with the dataset to search (or set a default dataset).');
     }
   } else {
-    const mapped = datasets.map((d) => {
+    const mapped = [...new Set(datasets)].map((d) => {
       ctx.indexes.add(d);
       const m = ctx.opts.indexMap?.[d];
       if (m && m !== d) ctx.note('info', `index="${d}" was mapped to dataset "${m}".`);
@@ -119,14 +135,57 @@ export function buildScope(raw: string, ctx: Ctx): string[] {
     }
     scope = mapped.length === 1 ? `dataset=${kqlString(mapped[0])}` : `dataset in (${mapped.map(kqlString).join(', ')})`;
   }
-  const prefix = ctx.inSubsearch ? 'cribl ' : '';
-  if (ctx.opts.filtersAsWhere) {
-    const out = [`${prefix}${scope}`];
-    if (!isEmptyPredicate(rest)) out.push(`where ${renderWhere(rest, ctx)}`);
-    return out;
+  // Field stages reproduced from Splunk knowledge (extractions, aliases, evals, lookups).
+  const shim: string[] = [];
+  if (k && ctx.opts.applyShim !== false) {
+    if (sourcetypes.length > 1) ctx.note('info', `Several sourcetypes are in scope (${sourcetypes.join(', ')}); their search-time field stages are applied in sequence.`);
+    const seen = new Set<string>();
+    for (const st of sourcetypes) {
+      const fresh = buildShim(st, k, ctx, { lookupToKql }).filter((line) => line.startsWith('//') || !seen.has(line));
+      fresh.forEach((line) => seen.add(line));
+      // Drop the header comment when every stage was already emitted for another sourcetype.
+      if (fresh.some((line) => !line.startsWith('//'))) shim.push(...fresh);
+    }
+    if (!sourcetypes.length && stSet.size) ctx.note('info', `No Splunk knowledge is loaded for sourcetype ${[...stSet].join(', ')}; field names pass through unchanged.`);
   }
-  const pred = renderScope(rest, ctx);
-  return [prefix + (pred ? `${scope} ${pred}` : scope)];
+  // Predicates on extracted fields must run after the field stages exist.
+  let scopePred = rest;
+  let later: SAst = { k: 'all' };
+  if (shim.length) {
+    const parts = partitionPredicate(rest);
+    scopePred = parts.scope;
+    later = parts.later;
+    if (!isEmptyPredicate(later)) ctx.note('info', 'Filters on extracted fields were moved after the Splunk field stages so the fields exist when they are evaluated.');
+  }
+  const prefix = ctx.inSubsearch ? 'cribl ' : '';
+  const out: string[] = [];
+  if (ctx.opts.filtersAsWhere) {
+    out.push(`${prefix}${scope}`);
+    if (!isEmptyPredicate(scopePred)) out.push(`where ${renderWhere(scopePred, ctx)}`);
+  } else {
+    const pred = renderScope(scopePred, ctx);
+    out.push(prefix + (pred ? `${scope} ${pred}` : scope));
+  }
+  out.push(...shim);
+  if (!isEmptyPredicate(later)) out.push(`where ${renderWhere(later, ctx)}`);
+  return out;
+}
+
+/** Stages that reproduce a Splunk data model object: constraints (scope + where), sourcetype shims and calculated fields. */
+export function dataModelStages(ref: string, extraSearch: string, ctx: Ctx): { stages: string[]; ok: boolean } {
+  const k = ctx.opts.knowledge;
+  const r = k ? resolveDataModel(ref, k) : null;
+  if (!k || !r) {
+    ctx.note('error', `Data model "${ref}" is not in the loaded Splunk knowledge; load the CIM app (or the app that defines it) to translate it.`);
+    return { stages: [], ok: false };
+  }
+  for (const p of objectPrefixes(r)) ctx.dmPrefixes.add(p);
+  const constraint = constraintSearch(r);
+  const search = [constraint, extraSearch].filter((x) => x.trim()).join(' ');
+  const stages = buildScope(search, ctx);
+  stages.push(...calculationStages(r, k, ctx, lookupToKql));
+  ctx.note('info', `Data model ${r.model.name}.${r.chain[r.chain.length - 1].name}: constraints ${r.chain.map((o) => o.constraints.join(' ')).filter(Boolean).map((c) => `"${c}"`).join(' + ') || '(none)'}; object prefixes are stripped from field names.`);
+  return { stages, ok: true };
 }
 
 /* ------------------------------------------------------------------ */
@@ -1058,12 +1117,16 @@ const tstats: Handler = (args, ctx, env) => {
   const { head: beforeBy, tail: byRaw } = splitKeyword(cleaned, 'by');
   const { head: beforeWhere, tail: whereRaw } = splitKeyword(beforeBy, 'where');
   const { head: aggRaw, tail: fromRaw } = splitKeyword(beforeWhere, 'from');
-  if (fromRaw && /datamodel/i.test(fromRaw)) {
-    ctx.note('error', `tstats FROM ${fromRaw} targets a Splunk data model, which has no Cribl equivalent; search the underlying dataset instead.`);
-    return { kql: [todo(`tstats ${args}`, 'tstats')], unsupported: true };
-  }
   let scope: string[] = [];
-  if (env.first) scope = buildScope(whereRaw ?? '', ctx);
+  const dm = fromRaw ? /datamodel\s*=\s*("?[^\s"]+"?(?:\."?[^\s"]+"?)?)/i.exec(fromRaw) : null;
+  if (dm) {
+    const r = dataModelStages(dm[1], whereRaw ?? '', ctx);
+    if (!r.ok) return { kql: [todo(`tstats ${args}`, 'tstats')], unsupported: true };
+    scope = r.stages;
+  } else if (fromRaw) {
+    ctx.note('error', `tstats FROM ${fromRaw} is not supported.`);
+    return { kql: [todo(`tstats ${args}`, 'tstats')], unsupported: true };
+  } else if (env.first) scope = buildScope(whereRaw ?? '', ctx);
   else if (whereRaw) {
     const rest = extractScope(parseSearch(whereRaw), ctx).rest;
     if (!isEmptyPredicate(rest)) scope = [`where ${renderWhere(rest, ctx)}`];
@@ -1073,6 +1136,16 @@ const tstats: Handler = (args, ctx, env) => {
   const byWords = byRaw ? words(byRaw) : [];
   const spanOpt = byWords.find((w) => /^span=/i.test(w));
   const groups = byWords.filter((w) => !/^[A-Za-z_]+=/.test(w));
+  if (dm && ctx.opts.knowledge) {
+    const r = resolveDataModel(dm[1], ctx.opts.knowledge);
+    if (r) {
+      const modelFields = new Set(r.chain.flatMap((o) => o.fields.map((f) => f.name)));
+      for (const g of groups) {
+        const bare = g.replace(/^[A-Za-z_][A-Za-z0-9_]*\./, '');
+        if (bare !== '_time' && !modelFields.has(bare)) ctx.note('warning', `"${g}" is not a field of data model ${r.model.name}.${r.chain[r.chain.length - 1].name}; Splunk tstats would return no results for it. The field is grouped on anyway.`);
+      }
+    }
+  }
   const isTime = groups.some((g) => g.toLowerCase() === '_time');
   if (/^(t|true|1)$/i.test(p.opts.prestats ?? '')) ctx.note('warning', 'prestats=t has no meaning in Cribl Search; a normal aggregation was emitted.');
   ctx.note('info', 'tstats reads Splunk index-time summaries; the emitted summarize runs over the dataset (Lakehouse-backed datasets are fastest).');
@@ -1139,10 +1212,26 @@ const fieldformat: Handler = (args, ctx, env) => {
   return evalCmd(args, ctx, env);
 };
 
+const datamodelCmd: Handler = (args, ctx) => {
+  const ws = words(args).filter((w) => !/^[A-Za-z_]+=/.test(w));
+  const model = ws[0];
+  if (!model) return { kql: [todo(`datamodel ${args}`, 'datamodel')], unsupported: true };
+  const object = ws[1] && !/^(search|flat|acceleration_search)$/i.test(ws[1]) ? ws[1] : undefined;
+  const r = dataModelStages(object ? `${model}.${object}` : model, '', ctx);
+  if (!r.ok) return { kql: [todo(`datamodel ${args}`, 'datamodel')], unsupported: true };
+  ctx.note('info', 'Fields are emitted without the Object. prefix Splunk adds for `| datamodel ... search`; later stages that use the prefix are rewritten.');
+  return { kql: r.stages };
+};
+
 const fromCmd: Handler = (args, ctx, env) => {
   const m = /^\s*(datamodel|lookup|savedsearch|inputlookup)\s*[:\s]\s*("?[^"\s]+"?)/i.exec(args);
   if (m && /lookup/i.test(m[1])) return inputlookup(m[2], ctx, env);
-  return unsupportedCmd(`from ${args.trim()} has no Cribl Search equivalent (data models and saved searches are not addressable).`)(args, ctx, env);
+  if (m && /datamodel/i.test(m[1])) {
+    const r = dataModelStages(m[2].replace(/"/g, ''), '', ctx);
+    if (!r.ok) return { kql: [todo(`from ${args}`, 'from')], unsupported: true };
+    return { kql: r.stages };
+  }
+  return unsupportedCmd(`from ${args.trim()} has no Cribl Search equivalent (saved searches are not addressable).`)(args, ctx, env);
 };
 
 /* ------------------------------------------------------------------ */
@@ -1203,6 +1292,7 @@ export const COMMANDS: Record<string, Handler> = {
   uniq,
   fieldformat,
   from: fromCmd,
+  datamodel: datamodelCmd,
   // silently skipped
   highlight: skipCmd('highlight only affects Splunk UI rendering; skipped.'),
   localop: skipCmd('localop is a Splunk execution hint; skipped.'),
@@ -1225,7 +1315,6 @@ export const COMMANDS: Record<string, Handler> = {
   metadata: unsupportedCmd('metadata has no Cribl Search equivalent; try `summarize min(_time), max(_time), count() by host` on the dataset.'),
   metasearch: unsupportedCmd('metasearch has no Cribl Search equivalent; run a normal search on the dataset.'),
   dbinspect: unsupportedCmd('dbinspect has no Cribl Search equivalent.'),
-  datamodel: unsupportedCmd('datamodel has no Cribl Search equivalent.'),
   mstats: unsupportedCmd('mstats has no direct equivalent; query the metrics dataset with `dataset="<metrics>" | where metric == "..." | summarize ...`.'),
   mcatalog: unsupportedCmd('mcatalog has no direct equivalent; try `dataset="<metrics>" | distinct metric`.'),
   savedsearch: unsupportedCmd('savedsearch cannot be referenced from a query; paste the saved query inline.'),
