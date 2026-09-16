@@ -1,0 +1,48 @@
+{
+  "name": "cc-visicore-spl-to-kql",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "lint": "oxlint",
+    "preview": "vite preview",
+    "package": "npm run build && node scripts/package.mjs",
+    "translate": "tsx scripts/translate.ts",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@capra/core": "^1.15.0",
+    "@capra/dx-tokens-postcss-plugin": "^0.4.0",
+    "@capra/icons": "^1.10.0",
+    "@capra/theme": "^1.6.0",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "react-router-dom": "^7.18.4"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.3",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.7",
+    "@vitejs/plugin-react": "^6.1.1",
+    "oxlint": "^1.81.0",
+    "tsx": "^4.23.13",
+    "typescript": "~6.0.2",
+    "vite": "^8.3.0",
+    "vitest": "^3.2.7"
+  },
+  "displayName": "SPL to KQL",
+  "author": "Andrew Hendrix",
+  "cribl": {
+    "type": "app",
+    "createAppScriptVersion": "0.5.0"
+  },
+  "tags": {
+    "product": [
+      "search"
+    ]
+  },
+  "description": "Translate Splunk SPL into Cribl Search KQL with stage-by-stage notes, syntax checking against your Cribl tenant, dataset/lookup/macro validation, and one-click run or save as a Cribl saved search.",
+  "license": "Apache-2.0"
+}
