@@ -183,7 +183,7 @@ config/
 ## Support
 
 ### Community Built
-This app is provided as a community contribution by VisiCore. It does not carry an official support commitment from Cribl. Open an issue in the repository or contact the maintainer, Andrew Hendrix.
+This app is provided as a community contribution by VisiCore. It does not carry an official support commitment from Cribl. Open an issue in the repository or email CriblPacks@VisiCoreTech.com.
 
 ## License
 
@@ -199,7 +199,7 @@ This app is licensed under the Apache License 2.0.
 | Author | VisiCore (Andrew Hendrix) |
 | Support Model | community-built |
 | Support Label | Community Built |
-| Support Contact | GitHub issues |
+| Support Contact | CriblPacks@VisiCoreTech.com or GitHub issues |
 | License | Apache-2.0 |
 | License File | [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0.txt) |
 | Product Tags | search |
