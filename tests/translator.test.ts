@@ -262,3 +262,12 @@ describe('time helpers', () => {
     expect(relativeTimeToKql('t', '@q')).toBeNull();
   });
 });
+
+describe('lookup-file datasets', () => {
+  it('maps "$vt_lookups:<file>" to a lookup scope', () => {
+    expect(translate('index=web status=500 | stats count', { indexMap: { web: '$vt_lookups:web_events.csv' }, knownDatasets: ['main'] }).kql).toBe(
+      'dataset="$vt_lookups" lookupFile="web_events" status=500\n| summarize count = count()',
+    );
+    expect(translate('status=500', { defaultDataset: '$vt_lookups:web_events' }).kql).toBe('dataset="$vt_lookups" lookupFile="web_events" status=500');
+  });
+});

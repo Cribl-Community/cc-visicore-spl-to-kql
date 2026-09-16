@@ -310,8 +310,15 @@ function App() {
   };
 
   /* ---------------- derived UI bits ---------------- */
-  const mapItems = useMemo(() => [{ id: '', label: '(use the index name as-is)' }, ...env.datasets.map((d) => ({ id: d.id, label: d.type ? `${d.id}  ·  ${d.type}` : d.id }))], [env.datasets]);
-  const datasetItems = useMemo(() => [{ id: '', label: '(none — require index= in SPL)' }, ...env.datasets.map((d) => ({ id: d.id, label: d.type ? `${d.id}  ·  ${d.type}` : d.id }))], [env.datasets]);
+  const datasetChoices = useMemo(
+    () => [
+      ...env.datasets.map((d) => ({ id: d.id, label: d.type ? `${d.id}  ·  ${d.type}` : d.id })),
+      ...env.lookups.map((l) => ({ id: `$vt_lookups:${l}`, label: `${l}  ·  lookup file` })),
+    ],
+    [env.datasets, env.lookups],
+  );
+  const mapItems = useMemo(() => [{ id: '', label: '(use the index name as-is)' }, ...datasetChoices], [datasetChoices]);
+  const datasetItems = useMemo(() => [{ id: '', label: '(none — require index= in SPL)' }, ...datasetChoices], [datasetChoices]);
 
   const refChips = useMemo(() => {
     const chips: { label: string; ok: boolean | null }[] = [];

@@ -129,7 +129,7 @@ export function buildScope(raw: string, ctx: Ctx): string[] {
     });
     for (const d of mapped) {
       ctx.datasets.add(d);
-      if (ctx.opts.knownDatasets && !d.includes('*') && !ctx.opts.knownDatasets.includes(d)) {
+      if (ctx.opts.knownDatasets && !d.includes('*') && !d.startsWith('$vt_') && !ctx.opts.knownDatasets.includes(d)) {
         ctx.note('warning', `index="${d}" does not match any Cribl Search dataset in this environment. Map it to the dataset that holds this data.`);
       }
     }
@@ -157,6 +157,8 @@ export function buildScope(raw: string, ctx: Ctx): string[] {
     later = parts.later;
     if (!isEmptyPredicate(later)) ctx.note('info', 'Filters on extracted fields were moved after the Splunk field stages so the fields exist when they are evaluated.');
   }
+  // "$vt_lookups:<file>" selects a Cribl lookup file as the dataset (useful for test data loaded as a lookup).
+  scope = scope.replace(/^dataset="\$vt_lookups:([^"]+)"$/, (_m, f: string) => `dataset="$vt_lookups" lookupFile=${kqlString(f.replace(/\.csv$/i, ''))}`);
   const prefix = ctx.inSubsearch ? 'cribl ' : '';
   const out: string[] = [];
   if (ctx.opts.filtersAsWhere) {
