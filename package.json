@@ -33,7 +33,7 @@
     "vitest": "^3.2.7"
   },
   "displayName": "SPL to KQL",
-  "author": "Andrew Hendrix",
+  "author": "Andrew Hendrix - ahendrix9624@gmail.com",
   "cribl": {
     "type": "app",
     "createAppScriptVersion": "0.5.0"
