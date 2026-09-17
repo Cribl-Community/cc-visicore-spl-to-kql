@@ -44,6 +44,7 @@ import { ReferencePanel } from './components/ReferencePanel';
 import { HistoryPanel } from './components/HistoryPanel';
 import { KnowledgePanel } from './components/KnowledgePanel';
 import { mergeKnowledge, type Knowledge } from './knowledge/types';
+import { describeExport, findExports } from './exports';
 
 type Tab = 'notes' | 'stages' | 'results' | 'reference' | 'knowledge' | 'history';
 
@@ -221,6 +222,9 @@ function App() {
 
   const hasQuery = result.kql.trim().length > 0;
   const plainKql = stripKqlComments(result.kql);
+  // Writes the query performs when run (outputlookup, collect); running or saving it must name them.
+  const writes = useMemo(() => findExports(plainKql), [plainKql]);
+  const writeTargets = writes.map((w) => (w.kind === 'lookup' ? `lookup "${w.name}"` : `${w.kind === 'lake' ? 'Lake' : 'Search'} dataset "${w.name}"`)).join(', ');
 
   /* ---------------- history ---------------- */
   const remember = useCallback(() => {
@@ -564,8 +568,20 @@ function App() {
         </div>
       </section>
 
-      <Modal isOpen={runOpen} onIsOpenChange={setRunOpen} title="Run in Cribl Search" confirmButtonText="Run search" onConfirm={() => void doRun()} onClose={() => setRunOpen(false)}>
+      <Modal
+        isOpen={runOpen}
+        onIsOpenChange={setRunOpen}
+        title={writes.length ? `Run and write to ${writeTargets}?` : 'Run in Cribl Search'}
+        confirmButtonText={writes.length ? `Run and write to ${writes.length === 1 ? writeTargets : `${writes.length} targets`}` : 'Run search'}
+        onConfirm={() => void doRun()}
+        onClose={() => setRunOpen(false)}
+      >
         <div className="modal-body">
+          {writes.length > 0 && (
+            <Alert appearance="danger" title="This search writes data when it runs">
+              {`${writes.map(describeExport).join(' ')} This cannot be undone from this app.`}
+            </Alert>
+          )}
           <Text variant="body-sm-normal">This creates a real search job in this tenant and consumes search credits. The query runs as-is; unsupported stages are left as comments.</Text>
           <div className="modal-row">
             <TextField label="Earliest" value={runEarliest} onChange={setRunEarliest} helperText="Relative (-24h, -1d@d) or epoch" />
@@ -578,6 +594,11 @@ function App() {
 
       <Modal isOpen={saveOpen} onIsOpenChange={setSaveOpen} title="Save as Cribl Search saved search" confirmButtonText="Create saved search" onConfirm={() => doSave()} onClose={() => setSaveOpen(false)}>
         <div className="modal-body">
+          {writes.length > 0 && (
+            <Alert appearance="warning" title="Every run of this saved search writes data">
+              {`${writes.map(describeExport).join(' ')} Saving does not write anything; each run, manual or scheduled, does.`}
+            </Alert>
+          )}
           <Text variant="body-sm-normal">Creates a new saved search in Cribl Search with the translated query and the time range below. Existing saved searches are never overwritten.</Text>
           <div className="modal-row">
             <TextField

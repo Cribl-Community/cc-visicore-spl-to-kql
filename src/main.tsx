@@ -5,6 +5,9 @@ import '@capra/core/styles.css'
 import '@capra/icons/styles.css'
 import App from './App'
 import './App.css'
+import { installThemeBridge } from './host-theme'
+
+installThemeBridge()
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
