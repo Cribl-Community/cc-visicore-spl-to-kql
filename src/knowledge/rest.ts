@@ -11,7 +11,7 @@
  *   /services/data/transforms/extractions REGEX/FORMAT/DELIMS/FIELDS/SOURCE_KEY/MV_ADD/REPEAT_MATCH
  *   /services/data/transforms/lookups     filename/match_type/case_sensitive_match/collection
  *   /services/saved/eventtypes            search + tags
- *   /services/admin/macros                definition (+ args)
+ *   /services/configs/conf-macros         definition (+ args)
  *   /services/datamodel/model             `description` holds the model JSON
  */
 import { applyTags, dataModelFromJson, knowledgeFromEventtypes, knowledgeFromMacros, knowledgeFromProps, knowledgeFromTransforms } from './conf';
