@@ -37,9 +37,9 @@ SPL to KQL is a Cribl app for teams moving searches, alerts and dashboards from 
 
 * Required Cribl product or deployment type: Cribl.Cloud with Cribl Search.
 * Required permissions or roles: the app declares read access to Search datasets, lookups, macros and docs, plus the ability to create search jobs and saved searches. Admins grant these when sharing the app.
-* Required external systems or APIs: none. The app makes no external calls.
-* Required configuration values: none. An optional default dataset can be set per user.
-* Known limits or prerequisites: translation is rule based, not AI based. It does not know your field extractions, so field names pass through unchanged.
+* Required external systems or APIs: none for translation. The optional backend functions reach GitHub (allowed by default) and your Splunk management API (allowed by an admin under Settings > External API Access). Backend functions need Cribl 4.20 or later.
+* Required configuration values: none. An optional default dataset can be set per user; the Splunk connection is optional.
+* Known limits or prerequisites: translation is rule based, not AI based. Without Splunk knowledge it does not know your field extractions, so field names pass through unchanged; load your add-ons (upload, URL import or Splunk sync) to reproduce them.
 
 ## Installation
 
@@ -60,13 +60,15 @@ SPL to KQL is a Cribl app for teams moving searches, alerts and dashboards from 
 
 | Setting | Required | Description | Example | Scope |
 |---|---|---|---|---|
-| Splunk knowledge | No | Add-on packages, .conf files, data model JSON or a knowledge.json bundle; enables search-time field reproduction and data model translation. | `Splunk_SA_CIM.tgz`, `TA-apache.tgz` | per-user |
+| Splunk knowledge (upload) | No | Add-on packages, .conf files, data model JSON or a knowledge.json bundle; enables search-time field reproduction and data model translation. | `Splunk_SA_CIM.tgz`, `TA-apache.tgz` | per-user |
+| Splunk knowledge (import from URL) | No | A backend function downloads and unpacks a package or GitHub archive and merges it into the shared bundle every user sees. | `https://github.com/splunk/addonfactory-splunk_sa_cim/archive/refs/heads/master.tar.gz` | shared |
+| Splunk connection | No | Splunk management URL and an authentication token. A backend function pulls props, transforms, eventtypes, tags, macros and data models over the Splunk REST API, on demand and nightly. The host must be allowed under Settings > External API Access. | `https://splunk.example.com:8089` | shared |
 | Splunk index → Cribl dataset | No | Per-index override used when the Splunk index name differs from the Cribl dataset id. Shown for every `index=` the SPL references. | `main` → `default_logs` | per-user |
 | Default dataset | No | Dataset used when the SPL has no `index=` clause. When unset the output contains `dataset="<DATASET>"` and an error note. | `default_logs` | per-user |
 | Emit first-stage filters as a where stage | No | Off (default) keeps Splunk-style filters in Cribl's initial stage, which is pushed down to the dataset provider. On moves them to a `where` stage. | off | per-user |
 | Earliest / Latest | No | Time range used when running or saving the translated query. Pre-filled from `earliest=`/`latest=` in the SPL. | `-24h` / `now` | per-user |
 
-All settings are saved in the app KV store per user and restored on the next visit.
+Per-user settings are saved in the app KV store and restored on the next visit. The shared knowledge bundle and the Splunk connection are stored once for the whole app; the token is stored encrypted and is only ever read by the platform proxy.
 
 ## How To Use
 
@@ -87,11 +89,13 @@ All settings are saved in the app KV store per user and restored on the next vis
 
 Splunk fields such as `src`, `action` or `Web.status` exist only because add-ons define search-time extractions, aliases, calculated fields, lookups, eventtypes and tags. The **Splunk knowledge** tab loads those definitions so the translation reproduces them in Cribl Search.
 
-What to load:
+Three ways to load it:
 
-* Add-on packages (`.tgz`/`.spl`) or their `props.conf`, `transforms.conf`, `eventtypes.conf`, `tags.conf`, `macros.conf` files.
-* The Common Information Model app (`Splunk_SA_CIM`) for data model definitions (`default/data/models/*.json`), or individual model JSON files.
-* A `knowledge.json` bundle built from a Splunk install: `npm run knowledge -- $SPLUNK_HOME/etc/system $SPLUNK_HOME/etc/apps/Splunk_SA_CIM $SPLUNK_HOME/etc/apps/<TA> --out knowledge.json`.
+* **Upload files** (this user only): add-on packages (`.tgz`/`.spl`) or their `props.conf`, `transforms.conf`, `eventtypes.conf`, `tags.conf`, `macros.conf` files; the Common Information Model app (`Splunk_SA_CIM`) for data model definitions (`default/data/models/*.json`) or individual model JSON files; or a `knowledge.json` bundle built from a Splunk install with `npm run knowledge -- $SPLUNK_HOME/etc/system $SPLUNK_HOME/etc/apps/Splunk_SA_CIM $SPLUNK_HOME/etc/apps/<TA> --out knowledge.json`.
+* **Import from URL** (shared): the `importUrl` backend function downloads a package or GitHub repository archive on the Cribl platform, unpacks it and merges it into the shared bundle. The default URL is the CIM add-on's GitHub archive. Uploads and URL imports merge; the summary shows the combined sources.
+* **Connect to Splunk** (shared): enter the Splunk management URL (port 8089) and a token, click **Save and test**, then **Sync now**. The `splunkSync` backend function reads `data/props/*`, `data/transforms/*`, `saved/eventtypes`, `admin/macros` and `datamodel/model` over the Splunk REST API and replaces the shared bundle with what the instance actually has. A schedule re-runs the sync nightly at 03:00 UTC. The Splunk host must be allowed for the app (see [External API Access](#external-api-access)); the token is injected by the platform proxy and never returned to app code.
+
+Shared knowledge is merged with the user's own uploads at translation time; the user's uploads win when both define the same sourcetype or model.
 
 What the translator does with it, in Splunk's search-time order:
 
@@ -132,14 +136,44 @@ Required permissions for core functionality (declared in `config/policies.yml`):
 
 If a user lacks access to an optional endpoint (datasets, lookups, macros, docs), translation still works and the header shows which metadata could not be loaded. Running and saving require the job and saved-search permissions.
 
+### Backend Functions
+
+Declared in `config/backend.yml` and `config/schedules.yml`; they run on the Cribl platform (Cribl 4.20 or later) and use the app's KV store and proxy configuration.
+
+| Function | Trigger | What it does |
+|---|---|---|
+| `importUrl` | **Import** button | Downloads an app/TA package or GitHub archive (up to 60 MB), parses its knowledge files and merges them into the shared bundle. |
+| `splunkSync` | **Save and test**, **Sync now**, nightly schedule `splunk-sync-nightly` (`0 3 * * *` UTC) | Tests the Splunk connection or pulls all knowledge objects over the Splunk REST API and replaces the shared bundle. Skips silently when no connection is configured. |
+
+The frontend calls them at `POST /api/v1/a/cc-visicore-spl-to-kql/endpoints/<name>`. Both are visible, with their schedule, under the app's Settings > Backend Functions.
+
 ## External API Access
 
-This app makes no external calls. `config/proxies.yml` declares no domains.
+`config/proxies.yml` allows these hosts for the backend functions (the frontend makes no external calls):
+
+| Host | Used by | Purpose |
+|---|---|---|
+| `github.com`, `codeload.github.com`, `objects.githubusercontent.com`, `raw.githubusercontent.com` | `importUrl` | Download add-on packages and repository archives. GitHub archive links are fetched from `codeload.github.com`, where they redirect. |
+| your Splunk management host | `splunkSync` | Splunk REST API. Not declared by default. |
+
+To enable the Splunk connection, an admin adds the Splunk host under the app's **Settings > External API Access** (or in `config/proxies.yml` before packaging) with the token injected from the encrypted KV key:
+
+```json
+{
+  "id": "splunk.example.com:8089",
+  "headers": { "inject": { "Authorization": "`Bearer ${kv.splunk_token}`" } },
+  "timeout": 120000,
+  "rejectUnauthorized": true
+}
+```
+
+Set `rejectUnauthorized` to `false` only for a self-signed Splunk certificate. The token itself is written by the Splunk knowledge tab to the KV key `splunk_token` with `?encrypted=true`; it cannot be read back by the app, only injected by the proxy.
 
 ## Data And Storage
 
-* KV keys: `users/<userId>/history` (last 50 conversions), `users/<userId>/prefs` (default dataset, index mapping, filter mode, time range) and `users/<userId>/knowledge` (the loaded Splunk knowledge bundle).
-* Data is persisted per user and is not shared across users.
+* Per-user KV keys: `users/<userId>/history` (last 50 conversions), `users/<userId>/prefs` (default dataset, index mapping, filter mode, time range) and `users/<userId>/knowledge` (uploaded Splunk knowledge).
+* Shared KV keys: `knowledge/shared` (bundle written by the backend functions), `knowledge/status` (last import/sync summary), `splunk/connection` (Splunk URL, last sync) and `splunk_token` (encrypted, write-only).
+* KV values are limited to about 100 KB, so knowledge bundles are gzipped and split across `<key>/c<n>` chunk keys with a small index at `<key>`. The CIM add-on alone is about 260 KB uncompressed.
 * Running a query creates a search job in Cribl Search like any other search. Saving creates a saved search. `outputlookup` translations become `export to lookup`, which writes a lookup when the query runs; the app flags this with a warning.
 
 ## Known Limitations
@@ -153,6 +187,13 @@ This app makes no external calls. `config/proxies.yml` declares no domains.
 * Splunk macros with arguments have no equivalent; Cribl macros are emitted as `${name}`.
 
 ## Troubleshooting
+
+### Import from URL or Sync now fails
+Check:
+* "Backend engine not initialized" or a timeout: the tenant must run Cribl 4.20 or later, and the app must be installed (not only previewed) for the platform backend to run.
+* "private broker request failed": the host is not reachable from the platform proxy. For GitHub, use an archive link (`.../archive/refs/heads/<branch>.tar.gz`, `.../archive/<tag>.tar.gz`), which the app fetches from `codeload.github.com`; release assets on `objects.githubusercontent.com` may not be reachable.
+* HTTP 403 from the Splunk URL: the host is not in the app's External API Access list, or the token was not saved (enter it and click Save and test again).
+* HTTP 401 from Splunk: the token is invalid or expired. Splunk tokens are created under Settings > Tokens.
 
 ### The App Opens But Some Features Do Not Work
 Possible causes:
@@ -189,7 +230,7 @@ npm run package    # build and create the .tgz app package
 ```text
 src/
   App.tsx                 main UI
-  knowledge/              Splunk knowledge: conf parsers, PCRE→RE2 regex conversion, sourcetype shim, data models, package reader
+  knowledge/              Splunk knowledge: conf parsers, REST payload parser, PCRE→RE2 regex conversion, sourcetype shim, data models, package reader, KV packing
   api.ts                  Cribl REST calls (datasets, lookups, macros, docs, preview, jobs, saved searches, KV)
   translator/             SPL → KQL translator (lexer, expressions, search scope, commands, entry point)
   components/             Notes, Stages, Results, Reference, History panels
@@ -199,16 +240,22 @@ images/                   README screenshots
 scripts/
   translate.ts            CLI (--knowledge knowledge.json)
   knowledge-from-dir.ts   build a knowledge bundle from Splunk app folders
-  package.mjs             app packaging
+  prepare-git-pack.mjs    git-pack layout for the release workflow
+backend/
+  import-url.ts           importUrl backend function
+  splunk-sync.ts          splunkSync backend function (also the nightly schedule target)
+  lib/                    KV helpers and shared-bundle merge
 tests/                    vitest suites
 config/
   policies.yml            Cribl API paths the app needs
-  proxies.yml             external domains (none)
+  proxies.yml             external hosts (GitHub; add your Splunk host)
+  backend.yml             backend function declarations
+  schedules.yml           nightly Splunk sync
 ```
 
 ## Versioning And Releases
 
-* Semantic versioning. `npm run package` bumps the patch version; use `-- --minor` or `-- --major` for larger changes.
+* Semantic versioning. `npm run build` bundles the frontend and backend functions; `npm run package -- --version X.Y.Z` writes `build/cc-visicore-spl-to-kql-X.Y.Z.tgz`.
 * Tagged releases carry the `.tgz` package for manual installs.
 
 ## Support
@@ -226,7 +273,7 @@ This app is licensed under the Apache License 2.0.
 |---|---|
 | App Name | SPL to KQL |
 | App ID | cc-visicore-spl-to-kql |
-| Version | 1.1.0 |
+| Version | 1.2.0 |
 | Author | VisiCore (Andrew Hendrix) |
 | Support Model | community-built |
 | Support Label | Community Built |

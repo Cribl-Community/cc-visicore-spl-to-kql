@@ -1,0 +1,6 @@
+# Scheduled backend runs (platform Schedule API). Top-level keys are schedule ids.
+# The nightly sync is a no-op until a Splunk connection is saved in the app.
+splunk-sync-nightly:
+  endpoint: splunkSync
+  cronSchedule: '0 3 * * *'
+  bodyExpression: '{ scheduleId, scheduledFor }'

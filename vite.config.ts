@@ -4,7 +4,9 @@ import { readFileSync } from 'node:fs'
 import { join } from 'path'
 import react from '@vitejs/plugin-react'
 // @ts-ignore
-import { servePackageTgz } from './scripts/pkgutil.mjs'
+import { servePackageTgz } from '@cribl/apps/package'
+// @ts-ignore
+import { backendPreviewPlugin, backendWatchPlugin } from '@cribl/apps/preview'
 
 const packageEndpointPlugin = () => ({
   name: 'vite-plugin-package-endpoint',
@@ -15,7 +17,7 @@ const packageEndpointPlugin = () => ({
   },
 })
 
-const WATCHED_CONFIG_FILES = ['package.json', 'config/proxies.yml', 'config/policies.yml'];
+const WATCHED_CONFIG_FILES = ['package.json', 'config/proxies.yml', 'config/policies.yml', 'config/schedules.yml', 'config/backend.yml'];
 const CONFIG_CHANGED_HMR_EVENT = 'cribl:config-changed';
 
 const CONFIG_CHANGED_BRIDGE = `
@@ -82,7 +84,7 @@ const injectScriptFromQueryPlugin = () => {
 };
 
 export default defineConfig({
-  plugins: [react(), packageEndpointPlugin(), injectScriptFromQueryPlugin()],
+  plugins: [react(), packageEndpointPlugin(), injectScriptFromQueryPlugin(), backendWatchPlugin(), backendPreviewPlugin()],
   base: './',
   server: {
     cors: true,

@@ -1,3 +1,5 @@
+import type { Knowledge } from './knowledge/types';
+import { deletePackedKnowledge, readPackedKnowledge, writePackedKnowledge, type KvIO } from './knowledge/kvpack';
 /**
  * Cribl REST API layer for the SPL → KQL app.
  *
@@ -300,14 +302,25 @@ async function kvLoad<T>(key: string): Promise<T | null> {
   const text = await resp.text();
   if (!text) return null;
   try {
-    return JSON.parse(text) as T;
+    // Values are stored as JSON text (see kvSave); older entries may be JSON objects.
+    let v: unknown = JSON.parse(text);
+    if (typeof v === 'string') {
+      try {
+        v = JSON.parse(v);
+      } catch {
+        /* plain string value */
+      }
+    }
+    return v as T;
   } catch {
     return null;
   }
 }
 
-async function kvSave(key: string, value: unknown): Promise<void> {
-  await request('PUT', `/kvstore/${key}`, { body: value });
+/** Store JSON as a text body so backend endpoints can read it back (the backend runtime stringifies object values). */
+async function kvSave(key: string, value: unknown, raw = false): Promise<void> {
+  const resp = await fetch(api() + `/kvstore/${key}`, { method: 'PUT', headers: { 'Content-Type': 'text/plain' }, body: raw ? String(value) : JSON.stringify(value) });
+  if (!resp.ok) throw new ApiError(resp.status, `KV write ${key} failed: HTTP ${resp.status}`);
 }
 
 const historyKey = (userId: string) => `users/${encodeURIComponent(userId)}/history`;
@@ -344,18 +357,104 @@ export async function savePrefs(userId: string, prefs: UserPrefs): Promise<void>
 
 const knowledgeKey = (userId: string) => `users/${encodeURIComponent(userId)}/knowledge`;
 
+/** Raw-text KV adapter for chunked knowledge bundles (see src/knowledge/kvpack.ts). */
+const kvIO: KvIO = {
+  async get(key) {
+    const resp = await request('GET', `/kvstore/${key}`, { ok404: true });
+    if (resp.status === 404) return null;
+    const text = await resp.text();
+    return text || null;
+  },
+  put: (key, text) => kvSave(key, text, true),
+  async del(key) {
+    await request('DELETE', `/kvstore/${key}`, { ok404: true });
+  },
+};
+
 /** Splunk knowledge bundle (props/transforms/eventtypes/tags/data models) saved per user. */
-export async function loadKnowledge<T>(userId: string): Promise<T | null> {
-  return kvLoad<T>(knowledgeKey(userId));
+export async function loadKnowledge(userId: string): Promise<Knowledge | null> {
+  return readPackedKnowledge(kvIO, knowledgeKey(userId));
 }
 
-export async function saveKnowledge(userId: string, knowledge: unknown | null): Promise<void> {
+export async function saveKnowledge(userId: string, knowledge: Knowledge | null): Promise<void> {
   if (knowledge === null) {
-    await request('DELETE', `/kvstore/${knowledgeKey(userId)}`, { ok404: true });
+    await deletePackedKnowledge(kvIO, knowledgeKey(userId));
     return;
   }
-  await kvSave(knowledgeKey(userId), knowledge);
+  await writePackedKnowledge(kvIO, knowledgeKey(userId), knowledge);
 }
+
+/* ------------------------------------------------------------------ */
+/* Backend endpoints and shared knowledge                                */
+/* ------------------------------------------------------------------ */
+
+export interface KnowledgeStatus {
+  updatedAt: number;
+  source: string;
+  summary: Record<string, number>;
+  bytes?: number;
+  error?: string;
+}
+
+export interface SplunkConnection {
+  baseUrl: string;
+  enabled?: boolean;
+  app?: string;
+  lastSync?: number;
+  lastServer?: string;
+}
+
+/** Shared (all-users) knowledge bundle written by the backend endpoints. */
+export const loadSharedKnowledge = (): Promise<Knowledge | null> => readPackedKnowledge(kvIO, 'knowledge/shared');
+export const loadKnowledgeStatus = (): Promise<KnowledgeStatus | null> => kvLoad<KnowledgeStatus>('knowledge/status');
+export const loadSplunkConnection = (): Promise<SplunkConnection | null> => kvLoad<SplunkConnection>('splunk/connection');
+
+export async function saveSplunkConnection(conn: SplunkConnection, token?: string): Promise<void> {
+  await kvSave('splunk/connection', conn);
+  if (token) {
+    // Encrypted keys are write-only for app code; the proxy injects the value into the Authorization header.
+    const resp = await fetch(api() + '/kvstore/splunk_token?encrypted=true', { method: 'PUT', headers: { 'Content-Type': 'text/plain' }, body: token });
+    if (!resp.ok) throw new ApiError(resp.status, `Could not store the token: HTTP ${resp.status} ${(await resp.text()).slice(0, 200)}`);
+  }
+}
+
+export async function clearSharedKnowledge(): Promise<void> {
+  await deletePackedKnowledge(kvIO, 'knowledge/shared');
+  await request('DELETE', '/kvstore/knowledge/status', { ok404: true });
+}
+
+async function callEndpoint<T>(name: string, body: unknown): Promise<T> {
+  const resp = await fetch(`${api()}/endpoints/${name}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const text = await resp.text();
+  let data: T & { ok?: boolean; error?: string };
+  try {
+    data = JSON.parse(text) as T & { ok?: boolean; error?: string };
+  } catch {
+    throw new ApiError(resp.status, `Endpoint ${name}: HTTP ${resp.status} ${text.slice(0, 300)}`);
+  }
+  if (!resp.ok || data.ok === false) throw new ApiError(resp.status, data.error ?? `Endpoint ${name} failed with HTTP ${resp.status}`);
+  return data;
+}
+
+export interface ImportUrlResult {
+  ok: true;
+  files: number;
+  loaded: string[];
+  status: KnowledgeStatus;
+}
+
+/** Backend: download an app/TA package from a URL and merge it into the shared bundle. */
+export const importKnowledgeFromUrl = (url: string, replace = false) => callEndpoint<ImportUrlResult>('importUrl', { url, replace });
+
+export interface SplunkSyncResult {
+  ok: true;
+  server?: { version?: string; serverName?: string };
+  counts?: { models: number; eventtypes: number };
+  status?: KnowledgeStatus;
+}
+
+/** Backend: test the Splunk connection or pull all knowledge objects. */
+export const splunkSync = (test = false) => callEndpoint<SplunkSyncResult>('splunkSync', { test });
 
 /** Current user id, or "anonymous" when running outside Cribl. */
 export async function currentUserId(): Promise<string> {

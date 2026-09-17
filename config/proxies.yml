@@ -1,27 +1,25 @@
-# External API declaration. Declare domains your app needs to reach.
-# At install time, admins see exactly which endpoints the app will use.
+# External hosts the app (frontend and backend endpoints) may reach through the platform proxy.
+# Admins can view and edit this list after install under the app's Settings > External API Access.
 
-# api.example.com:
-#   paths:
-#     allowlist:
-#       - /v1/
-#       - /api/public/
-#     blocklist:
-#       - /v1/internal/
-#       - /api/admin/
+# GitHub, for `importUrl`: app/TA packages and repository archives (e.g. the Splunk CIM add-on).
+# Archive links on github.com are fetched from codeload.github.com, which is where they redirect.
+github.com:
+  timeout: 120000
+codeload.github.com:
+  timeout: 120000
+objects.githubusercontent.com:
+  timeout: 120000
+raw.githubusercontent.com:
+  timeout: 120000
+
+# Splunk REST API, for `splunkSync`. Add your Splunk management endpoint (port 8089) here or in
+# Settings > External API Access after install. The bearer token is injected from the encrypted
+# KV key `splunk_token`, which the Splunk knowledge tab writes, so app code never sees it.
+# Set rejectUnauthorized to false only for a self-signed Splunk certificate.
+#
+# splunk.example.com:8089:
 #   headers:
 #     inject:
-#       Authorization: '`Bearer ${kv.api_key}`'
-#       X-API-Version: '2024-01'
-#     allowlist:
-#       - Content-Type
-#       - x-request-id
-#       - x-*
-#     blocklist:
-#       - X-Sensitive-Header
-#       - Cookie
-#   timeout: 30000
-#   # Verify the upstream TLS certificate chain. Leave as `true` for production
-#   # endpoints. Set to `false` only when targeting trusted internal endpoints
-#   # that present self-signed or otherwise untrusted certificates.
+#       Authorization: '`Bearer ${kv.splunk_token}`'
+#   timeout: 120000
 #   rejectUnauthorized: true

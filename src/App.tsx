@@ -11,7 +11,14 @@ import {
   listMacros,
   loadHistory,
   loadKnowledge,
+  loadKnowledgeStatus,
   loadPrefs,
+  loadSharedKnowledge,
+  loadSplunkConnection,
+  clearSharedKnowledge,
+  importKnowledgeFromUrl,
+  saveSplunkConnection,
+  splunkSync,
   runQuery,
   saveHistory,
   saveKnowledge,
@@ -21,7 +28,9 @@ import {
   type Dataset,
   type HistoryEntry,
   type JobResults,
+  type KnowledgeStatus,
   type KustoDocs,
+  type SplunkConnection,
   type SearchJob,
   type SyntaxCheck,
   type UserPrefs,
@@ -34,7 +43,7 @@ import { ResultsPanel } from './components/ResultsPanel';
 import { ReferencePanel } from './components/ReferencePanel';
 import { HistoryPanel } from './components/HistoryPanel';
 import { KnowledgePanel } from './components/KnowledgePanel';
-import type { Knowledge } from './knowledge/types';
+import { mergeKnowledge, type Knowledge } from './knowledge/types';
 
 type Tab = 'notes' | 'stages' | 'results' | 'reference' | 'knowledge' | 'history';
 
@@ -90,6 +99,9 @@ function App() {
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [knowledge, setKnowledge] = useState<Knowledge | null>(null);
   const [knowledgeError, setKnowledgeError] = useState<string | null>(null);
+  const [shared, setShared] = useState<Knowledge | null>(null);
+  const [sharedStatus, setSharedStatus] = useState<KnowledgeStatus | null>(null);
+  const [connection, setConnection] = useState<SplunkConnection | null>(null);
 
   // Run modal
   const [runOpen, setRunOpen] = useState(false);
@@ -137,14 +149,20 @@ function App() {
       const id = await currentUserId();
       if (cancelled) return;
       setUserId(id);
-      const [p, h, kn] = await Promise.all([
+      const [p, h, kn, sh, st, conn] = await Promise.all([
         loadPrefs(id).catch(() => ({}) as UserPrefs),
         loadHistory(id).catch(() => [] as HistoryEntry[]),
-        loadKnowledge<Knowledge>(id).catch(() => null),
+        loadKnowledge(id).catch(() => null),
+        loadSharedKnowledge().catch(() => null),
+        loadKnowledgeStatus().catch(() => null),
+        loadSplunkConnection().catch(() => null),
       ]);
       if (cancelled) return;
       setPrefs(p);
       if (kn) setKnowledge(kn);
+      setShared(sh);
+      setSharedStatus(st);
+      setConnection(conn);
       if (p.earliest) setRunEarliest(p.earliest);
       if (p.latest) setRunLatest(p.latest);
       setHistory(h);
@@ -168,6 +186,15 @@ function App() {
     [live, userId],
   );
 
+  const refreshShared = useCallback(async () => {
+    const [sh, st, conn] = await Promise.all([loadSharedKnowledge().catch(() => null), loadKnowledgeStatus().catch(() => null), loadSplunkConnection().catch(() => null)]);
+    setShared(sh);
+    setSharedStatus(st);
+    setConnection(conn);
+  }, []);
+
+  const effectiveKnowledge = useMemo(() => (shared && knowledge ? mergeKnowledge(shared, knowledge) : (shared ?? knowledge ?? undefined)), [shared, knowledge]);
+
   /* ---------------- translation ---------------- */
   const result: TranslationResult = useMemo(
     () =>
@@ -175,13 +202,13 @@ function App() {
         defaultDataset: prefs.defaultDataset || undefined,
         filtersAsWhere: !!prefs.filtersAsWhere,
         indexMap: prefs.indexMap,
-        knowledge: knowledge ?? undefined,
+        knowledge: effectiveKnowledge,
         applyShim: prefs.applyShim !== false,
         knownDatasets: env.datasets.length ? env.datasets.map((d) => d.id) : undefined,
         knownLookups: env.lookups.length ? env.lookups : undefined,
         knownMacros: env.macros.length ? env.macros : undefined,
       }),
-    [debouncedSpl, prefs.defaultDataset, prefs.filtersAsWhere, prefs.indexMap, prefs.applyShim, knowledge, env.datasets, env.lookups, env.macros],
+    [debouncedSpl, prefs.defaultDataset, prefs.filtersAsWhere, prefs.indexMap, prefs.applyShim, effectiveKnowledge, env.datasets, env.lookups, env.macros],
   );
 
   const syntax = syntaxState.kql === result.kql ? syntaxState : { kql: result.kql, state: 'idle' as const };
@@ -334,7 +361,7 @@ function App() {
     { key: 'stages', text: `Stages${result.stages.length ? ` (${result.stages.length})` : ''}` },
     { key: 'results', text: results ? `Results (${results.rows.length})` : 'Results' },
     { key: 'reference', text: 'Reference', icon: BookOutlined },
-    { key: 'knowledge', text: knowledge ? `Splunk knowledge (${Object.keys(knowledge.props).length} st)` : 'Splunk knowledge' },
+    { key: 'knowledge', text: effectiveKnowledge ? `Splunk knowledge (${Object.keys(effectiveKnowledge.props).length} st)` : 'Splunk knowledge' },
     { key: 'history', text: `History${history.length ? ` (${history.length})` : ''}`, icon: HistoryOutlined },
   ];
 
@@ -521,10 +548,16 @@ function App() {
             <KnowledgePanel
               knowledge={knowledge}
               onChange={changeKnowledge}
+              shared={shared}
+              sharedStatus={sharedStatus}
+              onSharedChanged={refreshShared}
               applyShim={prefs.applyShim !== false}
               onApplyShimChange={(v) => updatePrefs({ applyShim: v })}
               sourcetypes={result.sourcetypes}
               persistError={knowledgeError}
+              live={live}
+              connection={connection}
+              backend={{ importUrl: importKnowledgeFromUrl, splunkSync, saveConnection: saveSplunkConnection, clearShared: clearSharedKnowledge }}
             />
           )}
           {tab === 'history' && <HistoryPanel entries={history} onLoad={loadHistoryEntry} onClear={clearHistory} available={live} />}

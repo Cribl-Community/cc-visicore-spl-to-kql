@@ -457,3 +457,24 @@ body {
   overflow: hidden;
   pointer-events: none;
 }
+
+.knowledge-sources {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: token('spacing.md');
+}
+
+@media (max-width: 1100px) {
+  .knowledge-sources {
+    grid-template-columns: 1fr;
+  }
+}
+
+.knowledge-source {
+  display: flex;
+  flex-direction: column;
+  gap: token('spacing.sm');
+  padding: token('spacing.md');
+  border: token('border.default');
+  border-radius: token('radius.md');
+}
