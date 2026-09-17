@@ -11,6 +11,7 @@
     "package": "apps package",
     "translate": "tsx scripts/translate.ts",
     "test": "vitest run",
+    "test:live": "$SPL2KQL_CRIBL_CLI/.venv/bin/python tests/differential/run.py",
     "knowledge": "tsx scripts/knowledge-from-dir.ts"
   },
   "dependencies": {
