@@ -1,0 +1,15 @@
+# Backend endpoints (run on Cribl-managed compute, bundled by `apps build`).
+# Permissions are declared app-wide in config/policies.yml and config/proxies.yml.
+runtime: js
+
+endpoints:
+  - name: importUrl
+    script: backend/import-url.js
+    description: Import Splunk knowledge (props/transforms/eventtypes/tags/macros/data models) from an app or TA package at an https URL and store it as the shared knowledge bundle.
+    timeout: 120
+    memory: 512
+  - name: splunkSync
+    script: backend/splunk-sync.js
+    description: Pull knowledge objects from the configured Splunk instance over its REST API and store them as the shared knowledge bundle.
+    timeout: 120
+    memory: 512

@@ -1,0 +1,25 @@
+# External hosts the app (frontend and backend endpoints) may reach through the platform proxy.
+# Admins can view and edit this list after install under the app's Settings > External API Access.
+
+# GitHub, for `importUrl`: app/TA packages and repository archives (e.g. the Splunk CIM add-on).
+# Archive links on github.com are fetched from codeload.github.com, which is where they redirect.
+github.com:
+  timeout: 120000
+codeload.github.com:
+  timeout: 120000
+objects.githubusercontent.com:
+  timeout: 120000
+raw.githubusercontent.com:
+  timeout: 120000
+
+# Splunk REST API, for `splunkSync`. Add your Splunk management endpoint (port 8089) here or in
+# Settings > External API Access after install. The bearer token is injected from the encrypted
+# KV key `splunk_token`, which the Splunk knowledge tab writes, so app code never sees it.
+# Set rejectUnauthorized to false only for a self-signed Splunk certificate.
+#
+# splunk.example.com:8089:
+#   headers:
+#     inject:
+#       Authorization: '`Bearer ${kv.splunk_token}`'
+#   timeout: 120000
+#   rejectUnauthorized: true
