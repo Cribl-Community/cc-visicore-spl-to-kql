@@ -115,7 +115,7 @@ describe('eval expressions', () => {
     expect(expr('spath(payload, "order.items{}.sku")')).toBe('extract_json("$.order.items[*].sku", payload)');
   });
   it('quotes reserved field names', () => {
-    expect(body('index=w | eval range = a - b | sort -range')).toBe('dataset="w"\n| extend ["range"] = a - b\n| order by ["range"] desc');
+    expect(body('index=w | eval range = a - b | sort -range')).toBe('dataset="w"\n| extend ["range"] = a - b\n| order by ["range"] desc, _time desc');
   });
   it('reports unknown or unsupported functions', () => {
     const r = translate('index=w | eval x = mvcount(tags), y = frobnicate(1)');
@@ -130,12 +130,13 @@ describe('stats family', () => {
         'dataset="w"',
         '| where isnotnull(host) and isnotnull(status)',
         '| summarize count = count(), ips = dcount(ip), avg_rt = avg(rt), p95_rt = percentile(rt, 95), total = sum(bytes) by host, status',
-        '| order by count desc',
+        // Splunk's sort is stable: ties keep the stats output order (by-fields ascending).
+        '| order by count desc, host asc, status asc',
         '| limit 20',
       ].join('\n'),
     );
     expect(body('index=w | stats sum(bytes) by host | sort -sum(bytes) | rename sum(bytes) as tb')).toBe(
-      'dataset="w"\n| where isnotnull(host)\n| summarize sum_bytes = sum(bytes) by host\n| order by sum_bytes desc\n| project-rename tb = sum_bytes',
+      'dataset="w"\n| where isnotnull(host)\n| summarize sum_bytes = sum(bytes) by host\n| order by sum_bytes desc, host asc\n| project-rename tb = sum_bytes',
     );
   });
   it('handles count(eval()), first/last, range, list/values', () => {
@@ -146,7 +147,16 @@ describe('stats family', () => {
   it('eventstats and streamstats', () => {
     expect(body('index=w | eventstats avg(rt) as art by host')).toBe('dataset="w"\n| eventstats art = avg(rt) by host');
     expect(body('index=w | streamstats count as n, sum(bytes) as rb by host')).toBe(
-      'dataset="w"\n| order by host asc, _time desc\n| extend n = row_number(1, host != prev(host)), rb = row_cumsum(bytes, host != prev(host))',
+      [
+        'dataset="w"',
+        '| order by _time desc',
+        // Grouped calculations sort by group, then restore the incoming order (Splunk leaves it unchanged).
+        '| extend __ss_ord = row_number(1)',
+        '| order by host asc, __ss_ord asc',
+        '| extend n = row_number(1, host != prev(host)), rb = row_cumsum(bytes, host != prev(host))',
+        '| order by __ss_ord asc',
+        '| project-away __ss_ord',
+      ].join('\n'),
     );
   });
   it('timechart and chart', () => {
@@ -182,12 +192,30 @@ describe('field commands', () => {
     expect(body('index=w | fields + a b')).toBe('dataset="w"\n| project a, b');
     expect(body('index=w | table _time, "my field", host')).toBe('dataset="w"\n| project _time, ["my field"], host');
     expect(body('index=w | rename a AS b, c as d')).toBe('dataset="w"\n| project-rename b = a, d = c');
-    expect(body('index=w | sort 0 -bytes, +host')).toBe('dataset="w"\n| order by bytes desc, host asc');
-    expect(body('index=w | sort 10 num(x) desc')).toBe('dataset="w"\n| order by x desc\n| limit 10');
-    expect(body('index=w | head')).toBe('dataset="w"\n| limit 10');
-    expect(body('index=w | head limit=5')).toBe('dataset="w"\n| limit 5');
+    expect(body('index=w | sort 0 -bytes, +host')).toBe('dataset="w"\n| order by bytes desc, host asc, _time desc');
+    expect(body('index=w | sort 10 num(x) desc')).toBe('dataset="w"\n| order by x desc, _time desc\n| limit 10');
+    // head keeps the first results in the current order: newest first for events.
+    expect(body('index=w | head')).toBe('dataset="w"\n| order by _time desc\n| limit 10');
+    expect(body('index=w | head limit=5')).toBe('dataset="w"\n| order by _time desc\n| limit 5');
     expect(body('index=w | tail 3')).toBe('dataset="w"\n| order by _time asc\n| limit 3');
-    expect(body('index=w | dedup 2 host, ip sortby -_time')).toBe('dataset="w"\n| order by _time desc\n| dedup num_duplicates=2 by host, ip');
+    // dedup keeps the first results per key in the current order; sortby orders the output.
+    expect(body('index=w | dedup 2 host, ip sortby -_time')).toBe(
+      [
+        'dataset="w"',
+        // sortby applies before deduplication: the first results per key in sortby order are kept.
+        '| order by _time desc',
+        '| where isnotnull(host) and isnotnull(ip)',
+        '| extend __dd_ord = row_number(1)',
+        '| order by host asc, ip asc, __dd_ord asc',
+        '| extend __dd_n = row_number(1, host != prev(host) or ip != prev(ip))',
+        '| where __dd_n <= 2',
+        '| order by __dd_ord asc',
+        '| project-away __dd_ord, __dd_n',
+      ].join('\n'),
+    );
+    expect(body('index=w | sort 0 _time | dedup host sortby -bytes')).toContain('| order by bytes desc, _time asc\n| where isnotnull(host)');
+    expect(body('index=w | dedup keepempty=t host')).toContain('| where __dd_n <= 1 or isnull(host)');
+    expect(body('index=w | dedup keepempty=t consecutive=t host')).toContain('| extend __dd_prev0 = prev(host)\n| extend __dd_run = row_cumsum(iff(isnull(__dd_prev0) or host != __dd_prev0, 1, 0))');
   });
   it('bin, fillnull, makemv, mvexpand, spath, convert, strcat, addtotals, rangemap, replace', () => {
     expect(body('index=w | bin _time span=15m')).toBe('dataset="w"\n| extend _time = bin(_time, 15m)');
@@ -204,7 +232,13 @@ describe('field commands', () => {
   });
   it('rex named groups and sed mode', () => {
     expect(body('index=w | rex field=uri "^/api/(?<ver>v\\d+)/(?<res>\\w+)"')).toBe(
-      'dataset="w"\n| extend ver = extract(@"^/api/(?<ver>v\\d+)/(?<res>\\w+)", 1, uri), res = extract(@"^/api/(?<ver>v\\d+)/(?<res>\\w+)", 2, uri)\n| extend ver = iff(isempty(ver), null, ver), res = iff(isempty(res), null, res)',
+      [
+        'dataset="w"',
+        '| extend __rex0 = extract(@"^/api/(?<ver>v\\d+)/(?<res>\\w+)", 1, uri), __rex1 = extract(@"^/api/(?<ver>v\\d+)/(?<res>\\w+)", 2, uri)',
+        // A non-matching regex leaves the fields as they were, like Splunk rex.
+        '| extend ver = iff(isempty(__rex0), ver, __rex0), res = iff(isempty(__rex1), res, __rex1)',
+        '| project-away __rex0, __rex1',
+      ].join('\n'),
     );
     expect(body('index=w | rex mode=sed "s/pw=\\S+/pw=***/g"')).toBe('dataset="w"\n| extend _raw = replace_regex(_raw, @"pw=\\S+", @"pw=***")');
     expect(translate('index=w | rex "no groups"').unsupportedCount).toBe(1);
@@ -223,12 +257,12 @@ describe('multi-search', () => {
   it('append and join use inline subqueries with the cribl keyword', () => {
     expect(body('index=w | append [search index=cdn status=500 | stats count by host]')).toBe('dataset="w"\n| union (cribl dataset="cdn" status=500 | where isnotnull(host) | summarize count = count() by host)');
     expect(body('index=w | join type=left host [search index=inv | fields host, owner]')).toBe('dataset="w"\n| join kind=leftouter (cribl dataset="inv" | project host, owner) on host');
-    expect(body('| multisearch [search index=a] [search index=b | head 1]')).toBe('dataset="a"\n| union (cribl dataset="b" | limit 1)');
+    expect(body('| multisearch [search index=a] [search index=b | head 1]')).toBe('dataset="a"\n| union (cribl dataset="b" | order by _time desc | limit 1)');
   });
   it('makeresults, addinfo, delta, accum, xyseries, eventcount', () => {
     expect(body('| makeresults count=5 | eval x = random() % 10')).toBe('dataset="$vt_dummy" event<5\n| extend x = rand() % 10');
     expect(body('index=w | addinfo')).toContain('earliestTime()');
-    expect(body('index=w | delta bytes as d p=2 | accum bytes as c')).toBe('dataset="w"\n| extend d = bytes - prev(bytes, 2)\n| extend c = row_cumsum(bytes)');
+    expect(body('index=w | delta bytes as d p=2 | accum bytes as c')).toBe('dataset="w"\n| order by _time desc\n| extend d = bytes - prev(bytes, 2)\n| extend c = row_cumsum(bytes)');
     expect(body('index=w | xyseries host status count')).toBe('dataset="w"\n| pivot count over status by host');
     expect(body('| eventcount index=w')).toBe('dataset="w"\n| summarize count = count() by dataset');
   });
@@ -271,3 +305,124 @@ describe('lookup-file datasets', () => {
     expect(translate('status=500', { defaultDataset: '$vt_lookups:web_events' }).kql).toBe('dataset="$vt_lookups" lookupFile="web_events" status=500');
   });
 });
+
+// Regressions for semantics verified against live Splunk and Cribl Search (tests/differential).
+describe('search-expression semantics', () => {
+  it('evaluates OR before AND, unlike eval/where', () => {
+    expect(body('index=web a=1 AND b=1 OR c=1')).toBe('dataset="web" a=1 (b=1 OR c=1)');
+    expect(body('index=web a=1 b=1 OR c=1')).toBe('dataset="web" a=1 (b=1 OR c=1)');
+    expect(body('index=web c=1 OR b=1 AND a=1')).toBe('dataset="web" (c=1 OR b=1) a=1');
+    expect(body('index=web | search a=1 AND b=1 OR c=1')).toBe('dataset="web"\n| where a == 1 and (b == 1 or c == 1)');
+    expect(body('index=web | where a=1 AND b=1 OR c=1')).toBe('dataset="web"\n| where (a == 1 and b == 1) or c == 1');
+  });
+  it('keeps explicit groups, parenthesizing AND inside OR', () => {
+    expect(body('index=web (a=1 AND b=1) OR c=1')).toBe('dataset="web" (a=1 b=1) OR c=1');
+    expect(body('index=web | search (a=1 AND b=1) OR c=1')).toBe('dataset="web"\n| where (a == 1 and b == 1) or c == 1');
+    expect(body('| tstats count where index=web host=a AND source=b OR host=c')).toContain('host=a (source=b OR host=c)');
+  });
+  it('field!=value requires the field to exist; NOT field=value does not', () => {
+    expect(body('index=web user!=alice')).toBe('dataset="web" user!=alice user=*');
+    expect(body('index=web NOT user=alice')).toBe('dataset="web" NOT user=alice');
+    expect(body('index=web user!=alice OR status=500')).toBe('dataset="web" (user!=alice user=*) OR status=500');
+    expect(body('index=web NOT user!=alice')).toBe('dataset="web" NOT (user!=alice user=*)');
+    expect(body('index=web | search user!="alice" status!=200 uri!=/api*')).toBe(
+      'dataset="web"\n| where (isnotnull(user) and not(user =~ "alice")) and (isnotnull(status) and not(status == 200)) and (isnotnull(uri) and not(uri startswith "/api"))',
+    );
+    expect(body('index=web | search NOT user=alice')).toBe('dataset="web"\n| where not(user =~ "alice")');
+    // Metadata fields exist on every event.
+    expect(body('index=web host!=web1 | search sourcetype!=x')).toBe('dataset="web" host!=web1\n| where not(sourcetype =~ "x")');
+  });
+});
+
+describe('streamstats current=f', () => {
+  it('excludes the current event from count and sum', () => {
+    expect(body('index=web | streamstats current=f count as n sum(bytes) as total')).toBe(
+      [
+        'dataset="web"',
+        '| order by _time desc',
+        '| extend __ss_rank = row_number(1), __ss_sum0 = row_cumsum(bytes)',
+        '| extend n = __ss_rank - 1, total = iff(__ss_rank == 1, int(null), __ss_sum0 - coalesce(bytes, 0))',
+        '| project-away __ss_rank, __ss_sum0',
+      ].join('\n'),
+    );
+  });
+  it('restarts per group and keeps window functions out of iff()', () => {
+    const out = body('index=web | streamstats current=f count as n last(status) as prev_status by host');
+    expect(out).toContain('__ss_rank = row_number(1, host != prev(host)), __ss_prev0 = prev(status)');
+    expect(out).toContain('n = __ss_rank - 1, prev_status = iff(__ss_rank == 1, int(null), __ss_prev0)');
+  });
+  it('is unchanged when the current event is included', () => {
+    expect(body('index=web | streamstats count as n sum(bytes) as total by host')).toContain('| extend n = row_number(1, host != prev(host)), total = row_cumsum(bytes, host != prev(host))');
+  });
+});
+
+describe('streamstats ordering and count(field)', () => {
+  it('keeps the order of an earlier sort instead of assuming newest first', () => {
+    expect(body('index=web | sort 0 _time | streamstats sum(bytes) as total')).toBe('dataset="web"\n| order by _time asc\n| extend total = row_cumsum(bytes)');
+    expect(body('index=web | sort 0 -bytes | streamstats count as n by host')).toContain('| order by bytes desc, _time desc\n| extend __ss_ord = row_number(1)\n| order by host asc, __ss_ord asc\n| extend n = row_number(1, host != prev(host))\n| order by __ss_ord asc');
+    expect(body('index=web | tail 5 | streamstats count as n')).toContain('| order by _time asc\n| limit 5\n| extend n = row_number(1)');
+  });
+  it('follows stats group order and falls back to newest first', () => {
+    expect(body('index=web | stats sum(bytes) as b by host | streamstats sum(b) as run')).toContain('| order by host asc\n| extend run = row_cumsum(b)');
+    expect(body('index=web | streamstats count as n')).toContain('| order by _time desc\n| extend n = row_number(1)');
+    // A new result set without a known order drops the earlier sort.
+    expect(body('index=web | sort 0 bytes | stats count | streamstats count as n')).toContain('| order by _time desc');
+  });
+  it('count(field) counts only events that have the field', () => {
+    expect(body('index=web | streamstats count(user) as n by host')).toContain(
+      '| extend __ss_cnt0 = row_cumsum(iff(isnotnull(user), 1, 0), host != prev(host))\n| extend n = __ss_cnt0\n| order by __ss_ord asc\n| project-away __ss_ord, __ss_cnt0',
+    );
+    expect(body('index=web | streamstats current=f count(user) as n')).toContain('| extend n = __ss_cnt0 - iff(isnotnull(user), 1, 0)');
+  });
+});
+
+describe('result order', () => {
+  it('sort is stable: ties keep the incoming order', () => {
+    expect(body('index=w | stats count by src | sort -count | head 5')).toBe('dataset="w"\n| where isnotnull(src)\n| summarize count = count() by src\n| order by count desc, src asc\n| limit 5');
+  });
+  it('tail takes the last results of the current order, in reverse', () => {
+    expect(body('index=w | sort 0 _time | tail 2')).toContain('| order by _time asc\n| order by _time desc\n| limit 2');
+    expect(body('index=w | stats count by host | tail 1')).toContain('| order by host desc\n| limit 1');
+    expect(translate('index=w | append [search index=x] | tail 2').notes.some((n) => /define no result order/.test(n.message))).toBe(true);
+  });
+  it('reverse flips the current order', () => {
+    expect(body('index=w | sort 0 bytes | reverse')).toBe('dataset="w"\n| order by bytes asc, _time desc\n| order by bytes desc, _time asc');
+  });
+  it('head and delta do not repeat an order the previous stage already applied', () => {
+    expect(body('index=w | sort 0 _time | streamstats count as n by host | head 2')).toMatch(/\| order by __ss_ord asc\n\| project-away __ss_ord\n\| limit 2$/);
+    expect(body('index=w | sort 0 bytes | reverse | delta bytes as d')).toBe('dataset="w"\n| order by bytes asc, _time desc\n| order by bytes desc, _time asc\n| extend d = bytes - prev(bytes)');
+  });
+  it('warns where order by can drop rows beyond 10,000', () => {
+    const warned = (spl: string) => translate(spl).notes.some((n) => n.level === 'warning' && /at most 10,000 rows/.test(n.message));
+    expect(warned('index=w | sort 0 _time | stats count')).toBe(true);
+    expect(warned('index=w | streamstats count as n')).toBe(true);
+    expect(warned('index=w | reverse')).toBe(true);
+    // Splunk's sort without a count keeps 10,000 results too, and head/tail keep fewer.
+    expect(warned('index=w | sort -bytes')).toBe(false);
+    expect(warned('index=w | head 5')).toBe(false);
+    expect(warned('index=w | tail 5')).toBe(false);
+  });
+  it('first() and last() warn when an earlier stage changed the order', () => {
+    const warned = (spl: string) => translate(spl).notes.some((n) => n.level === 'warning' && /current result order/.test(n.message));
+    expect(warned('index=w | sort 0 bytes | stats first(uri)')).toBe(true);
+    expect(warned('index=w | stats first(uri)')).toBe(false);
+  });
+});
+
+describe('arithmetic grouping', () => {
+  it('keeps parentheses where equal-precedence operators are not interchangeable', () => {
+    expect(expr('2*(5%3)')).toBe('2 * (5 % 3)');
+    expect(expr('2*(8/4)')).toBe('2 * (8 / 4)');
+    expect(expr('8/(2*2)')).toBe('8 / (2 * 2)');
+    expect(expr('10-(4-1)')).toBe('10 - (4 - 1)');
+    expect(expr('2+(3-1)')).toBe('2 + (3 - 1)');
+    expect(expr('7%(2*3)')).toBe('7 % (2 * 3)');
+  });
+  it('drops parentheses that cannot change the value', () => {
+    expect(expr('(2*5)%3')).toBe('2 * 5 % 3');
+    expect(expr('2*(3*4)')).toBe('2 * 3 * 4');
+    expect(expr('2+(3+4)')).toBe('2 + 3 + 4');
+    expect(expr('(1+2)*3')).toBe('(1 + 2) * 3');
+  });
+});
+

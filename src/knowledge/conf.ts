@@ -204,7 +204,10 @@ export function knowledgeFromFiles(files: { path: string; text: string }[], sour
   let k = emptyKnowledge();
   const tagTexts: string[] = [];
   const csvNames: string[] = [];
-  for (const f of files) {
+  // Splunk lets local/ settings override default/ ones; archives list files in any order, so default/ is read first.
+  const rank = (path: string) => (path.toLowerCase().includes('/local/') ? 1 : 0);
+  const ordered = files.map((f, i) => ({ f, i })).sort((x, y) => rank(x.f.path) - rank(y.f.path) || x.i - y.i).map((x) => x.f);
+  for (const f of ordered) {
     const base = f.path.split('/').pop() ?? f.path;
     const lower = f.path.toLowerCase();
     if (lower.includes('/local/') || lower.includes('/default/') || !lower.includes('/')) {

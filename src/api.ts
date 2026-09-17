@@ -432,7 +432,12 @@ async function callEndpoint<T>(name: string, body: unknown): Promise<T> {
   } catch {
     throw new ApiError(resp.status, `Endpoint ${name}: HTTP ${resp.status} ${text.slice(0, 300)}`);
   }
-  if (!resp.ok || data.ok === false) throw new ApiError(resp.status, data.error ?? `Endpoint ${name} failed with HTTP ${resp.status}`);
+  if (!resp.ok || data.ok === false) {
+    const message = data.error ?? (data as { message?: string }).message ?? `Endpoint ${name} failed with HTTP ${resp.status}`;
+    // The platform answers 502/503/504 itself when the app's backend is not running, e.g. in Live Preview before "Deploy".
+    const hint = [502, 503, 504].includes(resp.status) ? ` (HTTP ${resp.status}: the app backend did not answer. In Live Preview, click Deploy first so the backend endpoints exist; otherwise check the app's backend status and retry.)` : '';
+    throw new ApiError(resp.status, message + hint);
+  }
   return data;
 }
 
@@ -449,7 +454,13 @@ export const importKnowledgeFromUrl = (url: string, replace = false) => callEndp
 export interface SplunkSyncResult {
   ok: true;
   server?: { version?: string; serverName?: string };
+  /** Test mode: one entry per knowledge endpoint the sync reads. */
+  checks?: { endpoint: string; ok: boolean; error?: string }[];
   counts?: { models: number; eventtypes: number };
+  /** Data models that could not be fetched: `kept` were carried over from the previous bundle, `failed` had no previous copy. */
+  partial?: boolean;
+  kept?: string[];
+  failed?: string[];
   status?: KnowledgeStatus;
 }
 

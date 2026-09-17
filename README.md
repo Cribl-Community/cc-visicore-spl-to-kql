@@ -63,6 +63,7 @@ SPL to KQL is a Cribl app for teams moving searches, alerts and dashboards from 
 | Splunk knowledge (upload) | No | Add-on packages, .conf files, data model JSON or a knowledge.json bundle; enables search-time field reproduction and data model translation. | `Splunk_SA_CIM.tgz`, `TA-apache.tgz` | per-user |
 | Splunk knowledge (import from URL) | No | A backend function downloads and unpacks a package or GitHub archive and merges it into the shared bundle every user sees. | `https://github.com/splunk/addonfactory-splunk_sa_cim/archive/refs/heads/master.tar.gz` | shared |
 | Splunk connection | No | Splunk management URL and an authentication token. A backend function pulls props, transforms, eventtypes, tags, macros and data models over the Splunk REST API, on demand and nightly. The host must be allowed under Settings > External API Access. | `https://splunk.example.com:8089` | shared |
+| Apply Splunk search-time field stages | No | On (default) emits the extraction, alias, calculated field and lookup stages for the sourcetypes in the query when knowledge is loaded. The line under the checkbox says what it adds for the current query. | on | per-user |
 | Splunk index → Cribl dataset | No | Per-index override used when the Splunk index name differs from the Cribl dataset id. Shown for every `index=` the SPL references. | `main` → `default_logs` | per-user |
 | Default dataset | No | Dataset used when the SPL has no `index=` clause. When unset the output contains `dataset="<DATASET>"` and an error note. | `default_logs` | per-user |
 | Emit first-stage filters as a where stage | No | Off (default) keeps Splunk-style filters in Cribl's initial stage, which is pushed down to the dataset provider. On moves them to a `where` stage. | off | per-user |
@@ -89,13 +90,21 @@ Per-user settings are saved in the app KV store and restored on the next visit. 
 
 Splunk fields such as `src`, `action` or `Web.status` exist only because add-ons define search-time extractions, aliases, calculated fields, lookups, eventtypes and tags. The **Splunk knowledge** tab loads those definitions so the translation reproduces them in Cribl Search.
 
+![Splunk knowledge tab: upload, import from URL and Splunk connection sources on top; the combined bundle's sources and the sourcetypes used by the current query; category tabs for sourcetypes, extractions, aliases, calculated fields, lookups, eventtypes, data models and macros; a filterable list with access_combined selected and its extractions, field aliases, calculated fields and automatic lookup shown on the right](images/splunk-knowledge.png)
+
 Three ways to load it:
 
 * **Upload files** (this user only): add-on packages (`.tgz`/`.spl`) or their `props.conf`, `transforms.conf`, `eventtypes.conf`, `tags.conf`, `macros.conf` files; the Common Information Model app (`Splunk_SA_CIM`) for data model definitions (`default/data/models/*.json`) or individual model JSON files; or a `knowledge.json` bundle built from a Splunk install with `npm run knowledge -- $SPLUNK_HOME/etc/system $SPLUNK_HOME/etc/apps/Splunk_SA_CIM $SPLUNK_HOME/etc/apps/<TA> --out knowledge.json`.
 * **Import from URL** (shared): the `importUrl` backend function downloads a package or GitHub repository archive on the Cribl platform, unpacks it and merges it into the shared bundle. The default URL is the CIM add-on's GitHub archive. Uploads and URL imports merge; the summary shows the combined sources.
-* **Connect to Splunk** (shared): enter the Splunk management URL (port 8089) and a token, click **Save and test**, then **Sync now**. The `splunkSync` backend function reads `data/props/*`, `data/transforms/*`, `saved/eventtypes`, `admin/macros` and `datamodel/model` over the Splunk REST API and replaces the shared bundle with what the instance actually has. A schedule re-runs the sync nightly at 03:00 UTC. The Splunk host must be allowed for the app (see [External API Access](#external-api-access)); the token is injected by the platform proxy and never returned to app code.
+* **Connect to Splunk** (shared): enter the Splunk management URL (port 8089) and a token, click **Save and test** (it checks the connection and that the token can read every endpoint the sync uses), then **Sync now**. The `splunkSync` backend function reads the documented knowledge endpoints `data/props/*`, `data/transforms/*`, `saved/eventtypes`, `configs/conf-macros` and `datamodel/model` over the Splunk REST API and replaces the shared bundle with what the instance actually has. A schedule re-runs the sync nightly at 03:00 UTC. The Splunk host must be allowed for the app (see [External API Access](#external-api-access)); the token is injected by the platform proxy and never returned to app code.
 
-Shared knowledge is merged with the user's own uploads at translation time; the user's uploads win when both define the same sourcetype or model.
+Shared knowledge is merged with the user's own uploads at translation time; the user's uploads win when both define the same rule. Merging works rule by rule, like Splunk's configuration layering: an `EVAL-x`, `EXTRACT-x`, `FIELDALIAS-x`, `REPORT-x` or `LOOKUP-x` replaces an earlier rule with the same name, a package's `local/` settings override its `default/` ones, and importing the same package again leaves the bundle unchanged.
+
+Browsing what is loaded: the tabs under the sources line (Sourcetypes, Extractions, Aliases, Calculated fields, Lookups, Eventtypes, Data models, Macros) each list the matching objects with a filter box that searches names and definitions. Selecting an item shows its full definition: a sourcetype's extraction regexes (with `REPORT` transforms resolved), aliases, calculated fields and lookups; a data model's datasets with their constraints, fields and calculated fields; an eventtype's search and tags; a macro's definition. Sourcetypes used by the query in the editor are listed first and marked **in query**.
+
+**Apply Splunk search-time field stages to translations** turns the per-sourcetype stages on or off. The line under it says what it does for the current query. If the loaded knowledge has nothing for the query's sourcetypes (for example `access_combined`, which Splunk defines in its own `etc/system` defaults rather than in `Splunk_SA_CIM`), the translation is the same either way; sync from Splunk or load the add-on that defines the sourcetype.
+
+Replacing or deleting the shared bundle (Sync now, Clear shared bundle) asks for confirmation first, because it changes the knowledge every user of the app sees. If some data models cannot be fetched during a sync, their previous definitions are kept and the sync is reported as partial.
 
 What the translator does with it, in Splunk's search-time order:
 
@@ -111,7 +120,9 @@ What the translator does with it, in Splunk's search-time order:
 
 Filters on extracted fields are moved after the field stages so the fields exist when they are evaluated. Lookups referenced by the knowledge must exist in Cribl Search as lookup files (the app validates their names).
 
-Verified end to end: identical Apache access logs were loaded into Splunk (`sourcetype=access_combined`, with `Splunk_SA_CIM` and a CIM web TA installed) and into Cribl Search, and 26 CIM-normalized queries (`stats by src, action, status_description`, `tag=web`, `eventtype=`, `tstats from datamodel=Web.Web ...`, `| datamodel`, `| from datamodel:`) returned identical results in both.
+When a query covers several sourcetypes whose knowledge differs, each sourcetype's aliases, calculated fields and extractions are applied only to its own events (`iff(sourcetype == "...", ...)`), so one sourcetype's `EVAL-kind` cannot overwrite another's. Automatic lookups cannot be limited this way and are flagged.
+
+Verified end to end: identical Apache access logs were loaded into Splunk (`sourcetype=access_combined`, with `Splunk_SA_CIM` and a CIM web TA installed) and into Cribl Search, and CIM-normalized queries (`stats by src, action, status_description`, `tag=web`, `eventtype=`, `tstats from datamodel=Web.Web ...`, `| datamodel`, `| from datamodel:`) returned identical results in both. See [Development](#development) for the differential test suite.
 
 ## Permissions
 
@@ -143,7 +154,7 @@ Declared in `config/backend.yml` and `config/schedules.yml`; they run on the Cri
 | Function | Trigger | What it does |
 |---|---|---|
 | `importUrl` | **Import** button | Downloads an app/TA package or GitHub archive (up to 60 MB), parses its knowledge files and merges them into the shared bundle. |
-| `splunkSync` | **Save and test**, **Sync now**, nightly schedule `splunk-sync-nightly` (`0 3 * * *` UTC) | Tests the Splunk connection or pulls all knowledge objects over the Splunk REST API and replaces the shared bundle. Skips silently when no connection is configured. |
+| `splunkSync` | **Save and test**, **Sync now**, nightly schedule `splunk-sync-nightly` (`0 3 * * *` UTC) | Tests the Splunk connection or pulls all knowledge objects over the Splunk REST API and replaces the shared bundle. A data model that cannot be fetched keeps its previous definition and the sync is reported as partial; if no data model can be fetched, the bundle is left unchanged. Skips silently when no connection is configured. |
 
 The frontend calls them at `POST /api/v1/a/cc-visicore-spl-to-kql/endpoints/<name>`. Both are visible, with their schedule, under the app's Settings > Backend Functions.
 
@@ -171,16 +182,19 @@ Set `rejectUnauthorized` to `false` only for a self-signed Splunk certificate. T
 
 ## Data And Storage
 
-* Per-user KV keys: `users/<userId>/history` (last 50 conversions), `users/<userId>/prefs` (default dataset, index mapping, filter mode, time range) and `users/<userId>/knowledge` (uploaded Splunk knowledge).
+* Per-user KV keys: `users/<userId>/history` (last 50 conversions), `users/<userId>/prefs` (default dataset, index mapping, filter mode, field stage toggle, time range) and `users/<userId>/knowledge` (uploaded Splunk knowledge).
 * Shared KV keys: `knowledge/shared` (bundle written by the backend functions), `knowledge/status` (last import/sync summary), `splunk/connection` (Splunk URL, last sync) and `splunk_token` (encrypted, write-only).
-* KV values are limited to about 100 KB, so knowledge bundles are gzipped and split across `<key>/c<n>` chunk keys with a small index at `<key>`. The CIM add-on alone is about 260 KB uncompressed.
-* Running a query creates a search job in Cribl Search like any other search. Saving creates a saved search. `outputlookup` translations become `export to lookup`, which writes a lookup when the query runs; the app flags this with a warning.
+* KV values are limited to about 100 KB, so knowledge bundles are gzipped and split across `<key>/g<generation>/c<n>` chunk keys with a small index at `<key>`. Each save writes a new generation and switches the index only after every chunk is stored, so a failed save leaves the previous bundle intact. Shared saves (URL import, Splunk sync) check that no other save replaced the bundle while they were merging, and merge again on top of it when one did, so two imports running at the same time both end up in the bundle. The KV store has no atomic compare-and-set, so a save that lands in the brief moment after that check can still replace another; the app reports an error rather than success when saves keep colliding. The CIM add-on alone is about 260 KB uncompressed.
+* Running a query creates a search job in Cribl Search like any other search. Saving creates a saved search. `outputlookup` translations become `export mode=overwrite to lookup` (or `mode=append` with `append=t`), which writes the lookup when the query runs; `collect` becomes an export to a Lake dataset. The Run dialog names each lookup or dataset the query writes, says whether it is replaced or appended to, and warns that it cannot be undone; the Save dialog warns that every run of the saved search writes it.
 
 ## Known Limitations
 
 * Translation is deterministic. Without loaded Splunk knowledge, field names pass through unchanged and data models, `tag=` and `eventtype=` cannot be resolved. With it, extractions that need PCRE-only regex features (lookarounds, backreferences), `FORMAT = $1::$2` key-value transforms, KV-store lookups, WILDCARD lookups and GeoIP calculations are reported rather than translated. Splunk `EXTRACT ... in <field>` runs before `REPORT` extractions, in both systems.
+* Field stages are emitted for the sourcetypes the query names (`sourcetype=`, `sourcetype IN (...)`, wildcards, or through `tag=`/`eventtype=` expansion). Splunk applies every sourcetype's knowledge to its own events, so a query such as `index=main host=web1` with no sourcetype term gets no field stages. Unless the query pins a single sourcetype, each sourcetype's stages are limited to its own events; automatic lookups cannot be limited that way and are flagged.
+* Result order is reproduced: `head`, `tail`, `reverse`, `dedup`, `delta`, `accum` and `streamstats` follow the order of the earlier stages (newest first for events, the `sort`, `stats ... by` or `timechart` order otherwise), `sort` keeps ties in their incoming order like Splunk, and grouped `streamstats` leaves the row order unchanged. `streamstats window=` (sliding windows) and `first()` are not supported, and `stats first()`/`last()` stay most recent/oldest (flagged when an earlier stage changed the order).
+* Cribl Search's `order by` returns at most 10,000 rows. Translations that must order more rows than that (`sort 0`, `reverse`, `dedup`, `delta`, `accum`, `streamstats`) carry a warning: rows beyond 10,000 are dropped before the later stages, where Splunk keeps them. `sort` without a count, `head` and `tail` are unaffected, because Splunk keeps at most 10,000 sorted results too.
 * Commands with no Cribl equivalent (`transaction`, `transpose`, `untable`, `appendcols`, `map`, `foreach`, `return`, `format`, `mvcombine`, most ML commands) are emitted as `// TODO` comments with an error note.
-* Some semantics differ and are flagged as notes: `dedup` works within a time window in Cribl; `coalesce()`/`fillnull` also replace empty strings; `strcat()` treats missing fields as empty (Splunk's `.` yields null); `first()`/`last()` map to `findlatest()`/`findearliest()`; `timestats` omits empty buckets and needs the `@` snap suffix to align buckets to the clock; `stats ... by` gets a `where isnotnull()` stage because Cribl keeps a null group.
+* Some semantics differ and are flagged as notes: `coalesce()`/`fillnull` also replace empty strings; `strcat()` treats missing fields as empty (Splunk's `.` yields null); `first()`/`last()` map to `findlatest()`/`findearliest()`; `timestats` omits empty buckets and needs the `@` snap suffix to align buckets to the clock; `stats ... by` gets a `where isnotnull()` stage because Cribl keeps a null group.
 * Regular expressions: `rex`, `extract` and `replace_regex` use RE2 (no lookarounds); `matches regex` uses ECMAScript regex literals.
 * Check syntax uses the Search preview endpoint. It parses and plans the query but does not apply dataset scope, filters, window functions or subqueries, so it cannot validate results. Run the query for that.
 * `iplocation` requires a GeoIP `.mmdb` lookup uploaded to Cribl Search; the placeholder name `geocity` must be replaced.
@@ -194,6 +208,7 @@ Check:
 * "private broker request failed": the host is not reachable from the platform proxy. For GitHub, use an archive link (`.../archive/refs/heads/<branch>.tar.gz`, `.../archive/<tag>.tar.gz`), which the app fetches from `codeload.github.com`; release assets on `objects.githubusercontent.com` may not be reachable.
 * HTTP 403 from the Splunk URL: the host is not in the app's External API Access list, or the token was not saved (enter it and click Save and test again).
 * HTTP 401 from Splunk: the token is invalid or expired. Splunk tokens are created under Settings > Tokens.
+* "Bad gateway" (HTTP 502/503/504) in Live Preview: the preview's backend functions do not exist until you click **Deploy**. Outside Live Preview, retry; the platform returns these when the app backend does not answer.
 
 ### The App Opens But Some Features Do Not Work
 Possible causes:
@@ -214,7 +229,8 @@ Check:
 ```bash
 npm install
 npm run dev        # live preview (open from Cribl's app dev page for API access)
-npm test           # translator unit tests (vitest)
+npm test           # unit tests (vitest)
+npm run test:live  # differential tests against a live Splunk and Cribl Search (see tests/differential/README.md)
 npm run translate -- 'index=web | stats count by host'   # CLI translation
 npm run knowledge -- $SPLUNK_HOME/etc/system $SPLUNK_HOME/etc/apps/Splunk_SA_CIM --out knowledge.json   # Splunk knowledge bundle
 npm run package    # build and create the .tgz app package
@@ -223,7 +239,7 @@ npm run package    # build and create the .tgz app package
 * `src/translator/` is a standalone, dependency-free module. It can be reused from Node or another app.
 * `scripts/translate.ts` is a small CLI around it. Add `--json` for the full result (stages, notes, time range) and `--filters-as-where` to emit first-stage filters as `where`.
 * `src/data/kql-catalog.ts` is a snapshot of the operator/function catalog from `GET /search/docs`; the app loads the live bundle at runtime and falls back to the snapshot.
-* Translations were verified with a differential test: the same events were loaded into Splunk (index `main`) and Cribl Search (as a lookup), 70 SPL queries were run in both, and the results compared row for row. The remaining differences are the documented semantic ones above.
+* Translations are verified with a differential test suite (`tests/differential/`): the same events are loaded into Splunk (index `main`) and Cribl Search (as lookups), each SPL query runs in Splunk and its translation runs as a Cribl search job, and the rows are compared. The suites cover commands and eval functions, search-expression semantics (`OR` binds tighter than `AND` in `search`; `field!=value` requires the field), CIM knowledge and data models, and several sourcetypes in one query, in both filter modes. Unit tests only pin the emitted text; add a differential case for any change to translation semantics. The remaining differences are the documented semantic ones above.
 
 ## Project Layout
 
@@ -233,10 +249,11 @@ src/
   knowledge/              Splunk knowledge: conf parsers, REST payload parser, PCRE→RE2 regex conversion, sourcetype shim, data models, package reader, KV packing
   api.ts                  Cribl REST calls (datasets, lookups, macros, docs, preview, jobs, saved searches, KV)
   translator/             SPL → KQL translator (lexer, expressions, search scope, commands, entry point)
-  components/             Notes, Stages, Results, Reference, History panels
+  components/             Notes, Stages, Results, Reference, History and Splunk knowledge panels, confirmation dialog
   data/                   KQL catalog snapshot and cheat sheet
   examples.ts             sample SPL queries
 images/                   README screenshots
+tests/differential/       live Splunk vs Cribl Search comparison suite
 scripts/
   translate.ts            CLI (--knowledge knowledge.json)
   knowledge-from-dir.ts   build a knowledge bundle from Splunk app folders
@@ -273,7 +290,7 @@ This app is licensed under the Apache License 2.0.
 |---|---|
 | App Name | SPL to KQL |
 | App ID | cc-visicore-spl-to-kql |
-| Version | 1.2.0 |
+| Version | 1.3.0 |
 | Author | VisiCore (Andrew Hendrix) |
 | Support Model | community-built |
 | Support Label | Community Built |

@@ -465,11 +465,60 @@ Cribl Search accepts, wrapped in a Capra UI that validates the output against th
 
 ## Differential testing
 
-Translations were verified by loading identical synthetic events into Splunk (index `main`,
-sourcetype `spl2kql`, via `receivers/simple`) and into Cribl Search (uploaded as the lookup
-`spl2kql_test_events.csv`, queried with `dataset="$vt_lookups" lookupFile="..."`), running ~70 SPL
-queries in Splunk and their translations as real Cribl search jobs, and comparing rows. Splunk
-CLI: `~/Documents/GitHub/splunk-dev-work/vct-splunk-cli`; Cribl CLI: `~/Documents/GitHub/vct-cribl-cli`.
+`tests/differential/` runs every case's SPL in a real Splunk and its translation as a real Cribl
+search job, then compares rows (suites: `generic`, `cim`, `multi`; each case in both `where` and
+`scope` filter modes). Setup and environment variables are in `tests/differential/README.md`; run with
+`npm run test:live`. **Any change to translator or shim semantics needs a case in `cases.py` and a
+green live run** — unit tests only pin the emitted text, and every bug below passed them:
+
+- The `search` command (also the first stage, `tstats where`, `inputlookup where`) evaluates OR before
+  AND; `eval`/`where` evaluate AND first. Cribl's scope stage also binds OR tighter than its implicit
+  AND, so `renderScope` parenthesizes AND groups inside OR.
+- `field!=value` matches only events that have the field; Cribl's `!=` (scope and `where`) also matches
+  events without it. Emitted as `f!=v f=*` / `isnotnull(f) and not(...)`. `NOT field=value` stays as is.
+- Window functions (`row_number`, `row_cumsum`, `prev`) nested inside `iff()` skip their restart
+  condition. Compute them in their own `extend`, then derive (`streamstats current=f`).
+- The `extract` operator leaves existing fields untouched on rows where the regex does not match, so a
+  per-sourcetype extraction is done from a copy of the source that is `""` for other sourcetypes.
+- Field stages run unguarded only when the query's top-level AND chain pins exactly one sourcetype
+  (`requiredSourcetype` in search.ts). Any other scope (several sourcetypes, wildcards, `IN` lists, OR
+  branches, sourcetypes without knowledge) wraps every alias/EVAL in `iff(sourcetype == "...", expr, field)`;
+  sourcetypes with identical rules share one `sourcetype in (...)` guard. Only sourcetypes named in the
+  query (or via tag/eventtype expansion) get stages; Splunk would apply every sourcetype's knowledge.
+- Result order is state: `ctx.order` is Splunk's current order (undefined = events, newest first; `[]` = none
+  defined), set by `sort`, `tail`, `reverse`, `dedup sortby`, `stats ... by`, `timechart`, `top`/`rare`;
+  `ctx.orderApplied` says whether Cribl rows are already physically in it (`runStage` clears it after any
+  non-streaming operator unless the stage ended with its own `order by`). Order-dependent handlers call
+  `inSplunkOrder(ctx)` first. `sort` appends the incoming order as a tiebreaker (Splunk's sort is stable).
+  `tail` flips the current order; `reverse` flips it. Grouped `streamstats` and `dedup` number rows
+  (`row_number(1)`), sort by key, compute, then `order by` the ordinal to restore the order. Splunk `dedup`
+  applies `sortby` before deduplicating and keeps every empty-key row with `keepempty=t`; Cribl's `dedup`
+  operator is time-windowed, so it is not used.
+- Cribl `order by` output is capped at 10,000 rows regardless of `topN` (verified: 12,000 → 10,000).
+  `orderCapNote` warns wherever a translation must order more rows than Splunk would keep.
+- `streamstats count(field)` counts non-null values (`row_cumsum(iff(isnotnull(f), 1, 0))`; a window
+  function *around* `iff()` restarts correctly, window functions *inside* `iff()` do not).
+- `rex` with no match leaves the target field's previous value (Splunk keeps it); extract into temporaries
+  and copy only non-empty results.
+- `summarize count()` over no rows returns no rows; Splunk `stats count` returns a zero row.
+- Arithmetic: `*`, `/`, `%` share a precedence level and group left to right in both engines, so a right
+  operand of equal precedence keeps its parentheses unless it is the same associative operator
+  (`2*(5%3)` is 4, `2*5%3` is 1). The `generic` suite has 83 generated expressions.
+- Cribl `export ... to lookup` defaults to `mode=create`, which fails when the lookup exists; Splunk
+  `outputlookup` replaces it, so the translation always writes `mode=overwrite` or `mode=append`.
+- Knowledge merges rule by rule (`mergeByName` in types.ts); `knowledgeFromFiles` reads `default/` before
+  `local/` regardless of archive order.
+- Splunk REST: use only documented endpoints (Splunk Cloud supports a documented subset; `/admin/` endpoints are
+  unsupported). Macros come from `configs/conf-macros` (verified identical to `admin/macros` on 10.4.2).
+  `KNOWLEDGE_ENDPOINTS` in splunk-sync.ts is the single list; Save and test (`{test:true}`) reads one entry from
+  each and fails (HTTP 422, not 502, which the UI treats as "backend did not answer") naming the unreadable ones.
+- Shared bundle writes go through `updateSharedKnowledge` (backend/lib/merge.ts): version check before the
+  index switch, re-read after `SETTLE_MS`, rebuild and retry on conflict. There is no KV compare-and-set;
+  do not write `knowledge/shared` any other way.
+- The comparator (`tests/differential/compare.py`) once sorted rows and read fields from the first row only,
+  which hid every ordering bug above. Keep `test_compare.py` rejecting wrong results; never loosen a
+  comparison globally, add a named option on the one case that needs it.
+
 Remaining differences are semantic and documented in README → Known Limitations.
 
 ## Catalog
@@ -492,9 +541,9 @@ The app loads the live bundle at runtime and only falls back to the snapshot.
   predicate on non-metadata fields to a `where` after the shim.
 - `datamodel.ts` resolves `Model.Object` chains, joins constraint searches (root → leaf), emits
   calculated fields (Eval/Rex/Lookup), and registers object names so `Web.status` → `status`.
-- Verified with `cim_diff.py` (session scratchpad): Splunk with Splunk_SA_CIM + `TA-spl2kql-web`
+- Verified with the `cim` differential suite: Splunk with Splunk_SA_CIM + `TA-spl2kql-web`
   (both installed under `~/Documents/GitHub/splunk-dev-work/splunk/etc/apps`) vs Cribl over the
-  `spl2kql_web_events` lookup, 26 CIM queries identical. Splunk runs `EXTRACT ... in <field>` BEFORE
+  `spl2kql_web_events` lookup. Splunk runs `EXTRACT ... in <field>` BEFORE
   `REPORT`, so an EXTRACT that depends on a REPORT field yields nothing in Splunk too.
 - Browser upload of `.tgz/.spl` packages uses `archive.ts` (pako + minimal tar reader); tested with
   `tests/fixtures/*.tgz`.

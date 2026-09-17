@@ -108,7 +108,22 @@ export function emptyKnowledge(): Knowledge {
   return { transforms: {}, props: {}, eventtypes: [], models: {}, lookupFiles: [], macros: {}, sources: [] };
 }
 
-/** Merge b into a (b wins on conflicts). */
+/**
+ * Rules keyed by their class name (`EXTRACT-<name>`, `EVAL-<name>`, ...): a later definition replaces an earlier
+ * one with the same name in place, like a `local` setting overriding `default` in Splunk, and merging the same
+ * knowledge twice changes nothing.
+ */
+function mergeByName<T extends { name: string }>(a: T[], b: T[]): T[] {
+  const out = [...a];
+  for (const item of b) {
+    const i = out.findIndex((x) => x.name === item.name);
+    if (i === -1) out.push(item);
+    else out[i] = item;
+  }
+  return out;
+}
+
+/** Merge b into a (b wins on conflicts, rule by rule). */
 export function mergeKnowledge(a: Knowledge, b: Knowledge): Knowledge {
   const props = { ...a.props };
   for (const [k, v] of Object.entries(b.props)) {
@@ -116,11 +131,11 @@ export function mergeKnowledge(a: Knowledge, b: Knowledge): Knowledge {
     props[k] = prev
       ? {
           sourcetype: k,
-          extracts: [...prev.extracts, ...v.extracts],
-          reports: [...prev.reports, ...v.reports],
-          aliases: [...prev.aliases, ...v.aliases],
-          evals: [...prev.evals, ...v.evals],
-          lookups: [...prev.lookups, ...v.lookups],
+          extracts: mergeByName(prev.extracts, v.extracts),
+          reports: mergeByName(prev.reports, v.reports),
+          aliases: mergeByName(prev.aliases, v.aliases),
+          evals: mergeByName(prev.evals, v.evals),
+          lookups: mergeByName(prev.lookups, v.lookups),
           kvMode: v.kvMode ?? prev.kvMode,
         }
       : v;

@@ -11,7 +11,17 @@ import type { Knowledge, SourcetypeKnowledge, Transform } from './types';
 export interface ShimOptions {
   /** Function that translates an SPL lookup spec ("table f AS g OUTPUT x") into KQL stages. */
   lookupToKql: (spec: string, ctx: Ctx) => string[];
+  /**
+   * Restrict every stage to events of this sourcetype. Needed when several sourcetypes are in
+   * scope, so one sourcetype's aliases and calculated fields do not overwrite another's.
+   */
+  guarded?: boolean;
+  /** Sourcetypes whose rules are identical to this one's; the guard matches any of them. Defaults to the sourcetype itself. */
+  guardSourcetypes?: string[];
 }
+
+/** Maps an extraction's source field to the `source=` argument of the extract operator. */
+type SourceArg = (source: string) => string;
 
 /** Rename duplicate named groups (RE2/Cribl reject them): second `domain` becomes `domain_2`. */
 function dedupeGroupNames(regex: string, ctx: Ctx, label: string): string {
@@ -79,7 +89,7 @@ function parseFormat(format: string): { mapping: { field: string; group: number 
 }
 
 /** One regex extraction → a Cribl `extract` operator stage (all named groups become fields; unmatched groups are null). */
-function regexStage(regex: string, source: string, format: string | undefined, k: Knowledge, ctx: Ctx, label: string, multi: boolean): string | null {
+function regexStage(regex: string, source: string, format: string | undefined, k: Knowledge, ctx: Ctx, label: string, multi: boolean, srcArg: SourceArg): string | null {
   const conv = convertSplunkRegex(regex, k.transforms);
   for (const n of conv.notes) ctx.note('warning', `${label}: ${n}`);
   let re = conv.regex;
@@ -94,15 +104,14 @@ function regexStage(regex: string, source: string, format: string | undefined, k
   }
   re = dedupeGroupNames(re, ctx, label);
   if (multi) ctx.note('warning', `${label}: MV_ADD/REPEAT_MATCH extractions are multivalue in Splunk; the extract operator keeps the first match.`);
-  const src = source === '_raw' ? '' : `source=${fieldRef(source, ctx)} `;
-  return `extract ${src}type=regex regex=${kqlVerbatim(re)}`;
+  return `extract ${srcArg(source)}type=regex regex=${kqlVerbatim(re)}`;
 }
 
-function transformStages(t: Transform, k: Knowledge, ctx: Ctx): string[] {
+function transformStages(t: Transform, k: Knowledge, ctx: Ctx, srcArg: SourceArg): string[] {
   const label = `transform ${t.name}`;
   const source = (t.sourceKey ?? '_raw').replace(/^field:/, '');
   if (t.regex) {
-    const st = regexStage(t.regex, source, t.format, k, ctx, label, !!(t.mvAdd || t.repeatMatch));
+    const st = regexStage(t.regex, source, t.format, k, ctx, label, !!(t.mvAdd || t.repeatMatch), srcArg);
     return st ? [st] : [];
   }
   if (t.delims) {
@@ -114,8 +123,7 @@ function transformStages(t: Transform, k: Knowledge, ctx: Ctx): string[] {
       ctx.note('warning', `${label}: DELIMS without FIELDS cannot be translated.`);
       return [];
     }
-    const src = source === '_raw' ? '' : `source=${fieldRef(source, ctx)} `;
-    return [`extract ${src}type=delim delimiter=${kqlString(t.delims[0])} ${kqlString(t.fields.join(','))}`];
+    return [`extract ${srcArg(source)}type=delim delimiter=${kqlString(t.delims[0])} ${kqlString(t.fields.join(','))}`];
   }
   return [];
 }
@@ -153,10 +161,27 @@ export function buildShim(sourcetype: string, k: Knowledge, ctx: Ctx, opts: Shim
   const prevCommand = ctx.command;
   ctx.command = `shim:${sourcetype}`;
 
+  const members = opts.guardSourcetypes?.length ? opts.guardSourcetypes : [sourcetype];
+  const isSt = members.length === 1 ? `sourcetype == ${kqlString(members[0])}` : `sourcetype in (${members.map(kqlString).join(', ')})`;
+  const only = (field: string, expr: string) => (opts.guarded ? `${field} = iff(${isSt}, ${expr}, ${field})` : `${field} = ${expr}`);
+
   // 1. Extractions (EXTRACT-* then REPORT-*, one extract stage per regex)
   const exStages: string[] = [];
+  // Guarded: the extract operator leaves existing fields alone when nothing matches, so other
+  // sourcetypes are excluded by extracting from a copy of the source that is empty for them.
+  const copies = new Map<string, string>();
+  const srcArg: SourceArg = (source) => {
+    if (!opts.guarded) return source === '_raw' ? '' : `source=${fieldRef(source, ctx)} `;
+    let tmp = copies.get(source);
+    if (!tmp) {
+      tmp = `__shim_src${copies.size}`;
+      copies.set(source, tmp);
+      exStages.push(`extend ${tmp} = iff(${isSt}, ${fieldRef(source, ctx)}, "")`);
+    }
+    return `source=${tmp} `;
+  };
   for (const e of sk.extracts) {
-    const st = regexStage(e.regex, e.inField ?? '_raw', undefined, k, ctx, `EXTRACT-${e.name}`, false);
+    const st = regexStage(e.regex, e.inField ?? '_raw', undefined, k, ctx, `EXTRACT-${e.name}`, false, srcArg);
     if (st) exStages.push(st);
   }
   for (const r of sk.reports) {
@@ -166,21 +191,22 @@ export function buildShim(sourcetype: string, k: Knowledge, ctx: Ctx, opts: Shim
         ctx.note('warning', `REPORT-${r.name}: transform "${tn}" is not in the loaded transforms.`);
         continue;
       }
-      exStages.push(...transformStages(t, k, ctx));
+      exStages.push(...transformStages(t, k, ctx, srcArg));
     }
   }
   stages.push(...exStages);
+  if (copies.size) stages.push(`project-away ${[...copies.values()].join(', ')}`);
   if (sk.kvMode && /^(json|xml|auto)$/i.test(sk.kvMode)) ctx.note('info', `KV_MODE=${sk.kvMode}: Cribl Search parses JSON and key=value pairs automatically; nothing emitted.`);
 
   // 2. Field aliases
   const aliases = sk.aliases.flatMap((a) => a.pairs);
   if (aliases.length) {
-    stages.push(`extend ${aliases.map((p) => (p.asNew ? `${fieldRef(p.to, ctx)} = coalesce(${fieldRef(p.to, ctx)}, ${fieldRef(p.from, ctx)})` : `${fieldRef(p.to, ctx)} = ${fieldRef(p.from, ctx)}`)).join(', ')}`);
+    stages.push(`extend ${aliases.map((p) => only(fieldRef(p.to, ctx), p.asNew ? `coalesce(${fieldRef(p.to, ctx)}, ${fieldRef(p.from, ctx)})` : fieldRef(p.from, ctx))).join(', ')}`);
   }
 
   // 3. Calculated fields (EVAL-*). Splunk evaluates them independently of each other.
   if (sk.evals.length) {
-    stages.push(`extend ${sk.evals.map((e) => `${fieldRef(e.field, ctx)} = ${translateExpr(e.expr, ctx)}`).join(', ')}`);
+    stages.push(`extend ${sk.evals.map((e) => only(fieldRef(e.field, ctx), translateExpr(e.expr, ctx))).join(', ')}`);
   }
 
   // 4. Lookups
@@ -188,10 +214,11 @@ export function buildShim(sourcetype: string, k: Knowledge, ctx: Ctx, opts: Shim
     const resolved = resolveLookupSpec(l.spec, k, ctx);
     if (resolved) stages.push(...lookupStages(resolved, ctx, opts.lookupToKql));
   }
+  if (opts.guarded && sk.lookups.length) ctx.note('warning', `Automatic lookups of sourcetype "${sourcetype}" cannot be limited to that sourcetype; they also enrich matching events of the other sourcetypes in scope.`);
 
   if (stages.length) {
-    ctx.note('info', `Applied Splunk knowledge for sourcetype "${sourcetype}": ${exStages.length} extraction(s), ${aliases.length} alias(es), ${sk.evals.length} calculated field(s), ${sk.lookups.length} lookup(s).`);
-    stages.unshift(`// Splunk search-time fields for sourcetype=${sourcetype}`);
+    ctx.note('info', `Applied Splunk knowledge for sourcetype "${members.join('", "')}": ${exStages.filter((x) => x.startsWith('extract ')).length} extraction(s), ${aliases.length} alias(es), ${sk.evals.length} calculated field(s), ${sk.lookups.length} lookup(s).`);
+    stages.unshift(`// Splunk search-time fields for ${members.map((m) => `sourcetype=${m}`).join(', ')}`);
   }
   ctx.command = prevCommand;
   return stages;

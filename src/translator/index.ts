@@ -43,7 +43,16 @@ function runStage(stage: Stage, ctx: Ctx, env: Env): HandlerResult {
     return { kql: [`// TODO (${stage.command}): not translated — ${stage.spl.replace(/\s+/g, ' ').trim()}`], unsupported: true };
   }
   try {
-    return handler(stage.args, ctx, env);
+    const before = ctx.order;
+    const r = handler(stage.args, ctx, env);
+    // Stages that build a new result set lose the previous order unless the handler recorded a new one.
+    if (ctx.order === before && r.kql.some((l) => /^(summarize|timestats|distinct|union|join|top|pivot)\b/.test(l))) ctx.order = [];
+    // Only streaming operators keep Cribl rows in the order an earlier order by produced. If the stage's last
+    // non-streaming operator is its own order by, the handler has already recorded the resulting state.
+    const streaming = /^(where|extend|project|project-away|project-rename|project-keep|limit|extract|lookup|mv-expand|\/\/)\b/;
+    const lastReorder = [...r.kql].reverse().find((l) => !streaming.test(l));
+    if (lastReorder && !lastReorder.startsWith('order by ')) ctx.orderApplied = false;
+    return r;
   } catch (e) {
     ctx.note('error', `Failed to translate "${stage.command}": ${(e as Error).message}`);
     return { kql: [`// TODO (${stage.command}): not translated — ${stage.spl.replace(/\s+/g, ' ').trim()}`], unsupported: true };
