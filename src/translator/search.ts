@@ -42,26 +42,28 @@ class SParser {
   }
   parse(): SAst {
     if (this.toks.length === 0) return { k: 'all' };
-    const e = this.parseOr();
+    const e = this.parseAnd();
     return e;
   }
-  parseOr(): SAst {
-    let l = this.parseAnd();
-    while (this.isWord('OR')) {
-      this.i++;
-      const r = this.parseAnd();
-      l = { k: 'or', l, r };
-    }
-    return l;
-  }
+  // The search command evaluates OR before AND (the reverse of eval/where):
+  // `a=1 AND b=1 OR c=1` means `a=1 AND (b=1 OR c=1)`.
   parseAnd(): SAst {
-    let l = this.parseNot();
+    let l = this.parseOr();
     for (;;) {
       if (this.isWord('AND')) this.i++;
       const t = this.peek();
-      if (!t || this.isWord('OR') || this.isOp(')')) break;
-      const r = this.parseNot();
+      if (!t || this.isOp(')')) break;
+      const r = this.parseOr();
       l = { k: 'and', l, r };
+    }
+    return l;
+  }
+  parseOr(): SAst {
+    let l = this.parseNot();
+    while (this.isWord('OR')) {
+      this.i++;
+      const r = this.parseNot();
+      l = { k: 'or', l, r };
     }
     return l;
   }
@@ -77,7 +79,7 @@ class SParser {
     if (!t) return { k: 'all' };
     if (t.t === 'op' && t.v === '(') {
       this.i++;
-      const e = this.parseOr();
+      const e = this.parseAnd();
       if (this.isOp(')')) this.i++;
       return e;
     }
@@ -184,10 +186,28 @@ function stripIndexes(a: SAst, out: string[]): SAst {
 /** Collect sourcetype=value terms anywhere in the predicate. */
 export function collectSourcetypes(a: SAst, out: Set<string>): void {
   if (a.k === 'cmp' && a.field.toLowerCase() === 'sourcetype' && a.op === '=') out.add(a.value);
+  else if (a.k === 'in' && a.field.toLowerCase() === 'sourcetype') a.values.forEach((v) => out.add(v.v));
   else if (a.k === 'and' || a.k === 'or') {
     collectSourcetypes(a.l, out);
     collectSourcetypes(a.r, out);
   } else if (a.k === 'not') collectSourcetypes(a.e, out);
+}
+
+/**
+ * The one sourcetype every matching event must have, when the predicate's top-level AND chain
+ * pins it with `sourcetype=value` (no wildcard). Null when events of other sourcetypes can match.
+ */
+export function requiredSourcetype(a: SAst): string | null {
+  const pinned = new Set<string>();
+  const visit = (t: SAst) => {
+    if (t.k === 'and') {
+      visit(t.l);
+      visit(t.r);
+    } else if (t.k === 'cmp' && t.field.toLowerCase() === 'sourcetype' && t.op === '=' && !t.value.includes('*')) pinned.add(t.value);
+    else if (t.k === 'in' && t.field.toLowerCase() === 'sourcetype' && t.values.length === 1 && !t.values[0].v.includes('*')) pinned.add(t.values[0].v);
+  };
+  visit(a);
+  return pinned.size === 1 ? [...pinned][0] : null;
 }
 
 /** Pull index= and time modifiers out of the top-level AND chain; expand tags, eventtypes and known macros. */
@@ -290,13 +310,26 @@ function scopeField(f: string, ctx: Ctx): string {
   return /^[A-Za-z_][A-Za-z0-9_.]*$/.test(n) ? n : '["' + n.replace(/"/g, '\\"') + '"]';
 }
 
+/** `field!=value` needs an explicit existence test, except on metadata fields every event carries. */
+function needsExistence(a: SAst): boolean {
+  return a.k === 'cmp' && a.op === '!=' && !META_FIELDS.has(a.field.toLowerCase());
+}
+
+/** True when the scope rendering of `a` is several AND-ed terms. */
+function isScopeConjunction(a: SAst): boolean {
+  return a.k === 'and' || needsExistence(a);
+}
+
 /** Render a predicate for Cribl's initial (implicit `cribl`) stage. */
 export function renderScope(ast: SAst, ctx: Ctx): string {
   switch (ast.k) {
     case 'all':
       return '';
-    case 'cmp':
-      return `${scopeField(ast.field, ctx)}${ast.op}${scopeValue(ast.value, ast.quoted)}`;
+    case 'cmp': {
+      const term = `${scopeField(ast.field, ctx)}${ast.op}${scopeValue(ast.value, ast.quoted)}`;
+      // SPL `field!=value` only matches events that have the field; Cribl's != also matches events without it.
+      return needsExistence(ast) ? `${term} ${scopeField(ast.field, ctx)}=*` : term;
+    }
     case 'in':
       return `${scopeField(ast.field, ctx)} IN (${ast.values.map((v) => scopeValue(v.v, v.quoted)).join(', ')})`;
     case 'text':
@@ -312,12 +345,14 @@ export function renderScope(ast: SAst, ctx: Ctx): string {
       const r = renderScope(ast.r, ctx);
       if (!l) return r;
       if (!r) return l;
-      return `${l} OR ${r}`;
+      // Cribl's initial stage, like SPL, binds OR tighter than the implicit AND.
+      const wrap = (s: string, a: SAst) => (isScopeConjunction(a) ? `(${s})` : s);
+      return `${wrap(l, ast.l)} OR ${wrap(r, ast.r)}`;
     }
     case 'not': {
       const e = renderScope(ast.e, ctx);
       if (!e) return '';
-      return ast.e.k === 'and' || ast.e.k === 'or' ? `NOT (${e})` : `NOT ${e}`;
+      return ast.e.k === 'or' || isScopeConjunction(ast.e) ? `NOT (${e})` : `NOT ${e}`;
     }
     case 'sub':
       ctx.note('error', `Subsearch [${ast.v}] inside a search expression has no Cribl equivalent; it was dropped. Consider a let statement or a join.`);
@@ -360,7 +395,9 @@ export function renderWhere(ast: SAst, ctx: Ctx): string {
           const v = whereValue(ast.value, ast.quoted);
           pred = v.numeric ? `${f} == ${v.kql}` : `${f} =~ ${v.kql}`;
         }
-        return ast.op === '!=' ? `not(${pred})` : pred;
+        if (ast.op !== '!=') return pred;
+        // SPL `field!=value` only matches events that have the field (unlike `NOT field=value`).
+        return needsExistence(ast) ? `(isnotnull(${f}) and not(${pred}))` : `not(${pred})`;
       }
       const v = whereValue(ast.value, ast.quoted);
       return `${f} ${ast.op} ${v.kql}`;
@@ -394,8 +431,10 @@ export function renderWhere(ast: SAst, ctx: Ctx): string {
       const wrap = (a: SAst) => (a.k === 'or' ? `(${renderWhere(a, ctx)})` : renderWhere(a, ctx));
       return `${wrap(ast.l)} and ${wrap(ast.r)}`;
     }
-    case 'or':
-      return `${renderWhere(ast.l, ctx)} or ${renderWhere(ast.r, ctx)}`;
+    case 'or': {
+      const wrap = (a: SAst) => (a.k === 'and' ? `(${renderWhere(a, ctx)})` : renderWhere(a, ctx));
+      return `${wrap(ast.l)} or ${wrap(ast.r)}`;
+    }
     case 'not':
       return `not(${renderWhere(ast.e, ctx)})`;
     case 'sub':

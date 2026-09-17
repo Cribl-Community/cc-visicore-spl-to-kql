@@ -103,6 +103,15 @@ export interface Ctx {
   /** Data model object names whose `Object.field` prefix is stripped from field references. */
   dmPrefixes: Set<string>;
   timeRange: TimeRange;
+  /**
+   * Splunk's current result order as KQL `field dir` terms, recorded by the stage that produced it
+   * (`sort`, `tail`, `reverse`, `stats ... by`, `timechart`, `top`). Undefined means raw events, which
+   * Splunk returns newest first; an empty array means Splunk defines no order (e.g. after `append`).
+   * Order-dependent stages (head, tail, reverse, streamstats, delta, accum, dedup) reproduce it.
+   */
+  order?: string[];
+  /** True when the Cribl rows are already physically in `order` (an order by ran and nothing reshaped since). */
+  orderApplied?: boolean;
   /** True while translating a subsearch (append/join/union); subqueries need the explicit `cribl` keyword. */
   inSubsearch: boolean;
   note(level: NoteLevel, message: string): void;

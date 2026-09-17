@@ -107,6 +107,25 @@ const body = (spl: string, opts = {}) =>
     .join('\n');
 
 describe('conf parsing', () => {
+  it('local/ overrides default/ rule by rule, whatever order the package lists the files in', () => {
+    const files = [
+      { path: '/TA-x/local/props.conf', text: '[st]\nEVAL-x = x + 10\nFIELDALIAS-a = c AS d\n' },
+      { path: '/TA-x/default/props.conf', text: '[st]\nEVAL-x = x + 1\nEVAL-y = 2\nFIELDALIAS-a = a AS b\n' },
+    ];
+    for (const order of [files, [...files].reverse()]) {
+      const st = knowledgeFromFiles(order, 'TA-x').props.st;
+      expect(st.evals.map((e) => `${e.field}=${e.expr}`)).toEqual(['x=x + 10', 'y=2']);
+      expect(st.aliases.map((al) => al.pairs.map((pr) => `${pr.from}>${pr.to}`).join())).toEqual(['c>d']);
+    }
+    const kql = translate('index=main sourcetype=st | stats count by x', { knowledge: knowledgeFromFiles(files, 'TA-x') }).kql;
+    expect(kql.match(/extend .*x = /g)).toHaveLength(1);
+  });
+  it('merging the same knowledge again leaves the bundle unchanged', () => {
+    const k = knowledge();
+    const again = mergeKnowledge(k, knowledge());
+    expect(again).toEqual(k);
+    expect(mergeKnowledge(again, knowledge())).toEqual(k);
+  });
   it('parses stanzas, continuations and comments', () => {
     const c = parseConf('# c\n[a]\nk = v \\\n  more\nx=1\n[b]\ny = 2');
     expect(c.a.k).toBe('v \n  more');
@@ -206,6 +225,41 @@ describe('shim', () => {
     expect(out).toContain('| extract type=delim delimiter="," "a,b,c"');
     expect(out).toContain('| lookup matchMode=cidr output="net_name" nets on cidr=src');
   });
+  it('limits each sourcetype\'s stages to its own events when several are in scope', () => {
+    const k = knowledge();
+    const st = (evals: { field: string; expr: string }[], extra = {}) => ({ extracts: [], reports: [], aliases: [], evals, lookups: [], ...extra });
+    k.props.a = { sourcetype: 'a', ...st([{ field: 'kind', expr: '"A"' }], { extracts: [{ name: 'v', regex: '^/api/(?<ver>v\\d+)', inField: 'uri' }], aliases: [{ name: 'x', pairs: [{ from: 'clientip', to: 'src' }] }] }) };
+    k.props.b = { sourcetype: 'b', ...st([{ field: 'kind', expr: '"B"' }]) };
+    k.props.b2 = { sourcetype: 'b2', ...st([{ field: 'kind', expr: '"B"' }]) };
+    const out = translate('index=main (sourcetype=a OR sourcetype=b) | stats count by kind', { knowledge: k }).kql.split('\n');
+    expect(out).toContain('| extend __shim_src0 = iff(sourcetype == "a", uri, "")');
+    expect(out).toContain('| extract source=__shim_src0 type=regex regex=@"^/api/(?<ver>v\\d+)"');
+    expect(out).toContain('| project-away __shim_src0');
+    expect(out).toContain('| extend src = iff(sourcetype == "a", clientip, src)');
+    expect(out).toContain('| extend ["kind"] = iff(sourcetype == "a", "A", ["kind"])');
+    expect(out).toContain('| extend ["kind"] = iff(sourcetype == "b", "B", ["kind"])');
+    // Sourcetypes with identical rules share one guard; a wildcard can still match other sourcetypes.
+    const same = translate('index=main sourcetype=b*', { knowledge: k }).kql;
+    expect(same.match(/extend \["kind"\]/g)).toHaveLength(1);
+    expect(same).toContain('| extend ["kind"] = iff(sourcetype in ("b", "b2"), "B", ["kind"])');
+  });
+  it('guards the rules unless the query pins exactly one sourcetype', () => {
+    const k = knowledge();
+    k.props.a = { sourcetype: 'a', extracts: [], reports: [], aliases: [], evals: [{ name: 'kind', field: 'kind', expr: '"A"' }], lookups: [] };
+    const kql = (spl: string) => translate(spl, { knowledge: k }).kql;
+    const guarded = '| extend ["kind"] = iff(sourcetype == "a", "A", ["kind"])';
+    // Only a has rules, but b's events are in scope too.
+    expect(kql('index=main (sourcetype=a OR sourcetype=b) | stats count by kind')).toContain(guarded);
+    expect(kql('index=main sourcetype=a OR host=web1 | stats count by kind')).toContain(guarded);
+    // IN lists are sourcetype terms too.
+    expect(kql('index=main sourcetype IN (a, b) | stats count by kind')).toContain(guarded);
+    expect(kql('index=main sourcetype IN (a) | stats count by kind')).toContain('| extend ["kind"] = "A"');
+    expect(kql('index=main sourcetype=a | stats count by kind')).toContain('| extend ["kind"] = "A"');
+  });
+  it('lists sourcetypes without knowledge next to the ones it covers', () => {
+    const r = translate('index=main (sourcetype=access_combined OR sourcetype=nothing_known) | stats count', { knowledge: knowledge() });
+    expect(r.sourcetypes.sort()).toEqual(['access_combined', 'nothing_known']);
+  });
   it('can be disabled and reports unknown sourcetypes', () => {
     expect(body('index=main sourcetype=access_combined | stats count', { applyShim: false })).toBe('dataset="main" sourcetype=access_combined\n| summarize count = count()');
     const r = translate('index=main sourcetype=nothing_known | stats count', { knowledge: knowledge() });
@@ -214,6 +268,12 @@ describe('shim', () => {
 });
 
 describe('tags, eventtypes and data models', () => {
+  it('treats data model calculated fields as model fields in tstats by-clauses', () => {
+    const notes = (spl: string) => translate(spl, { knowledge: knowledge() }).notes.filter((n) => /is not a field of data model/.test(n.message)).map((n) => n.message);
+    // url_domain exists only as a Rex calculation output.
+    expect(notes('| tstats count from datamodel=Web.Web by Web.url_domain')).toEqual([]);
+    expect(notes('| tstats count from datamodel=Web.Web by Web.nosuchfield')).toHaveLength(1);
+  });
   it('expands tag= and eventtype= into eventtype searches and pulls index= into the scope', () => {
     expect(body('tag=web | stats count by src').split('\n')[0]).toBe('dataset="main" sourcetype=access_combined OR sourcetype=access_common');
     expect(body('eventtype=audit | stats count').split('\n')[0]).toBe('dataset="_audit" sourcetype=audittrail');

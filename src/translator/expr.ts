@@ -639,7 +639,9 @@ export function renderExpr(ast: Ast, ctx: Ctx, opts: RenderOptions = {}): string
         const s = r(child);
         if (isBin(child) && child.op !== '.' && child.op !== 'like') {
           const cp = PREC[child.op] ?? 4;
-          if (cp < myPrec || (cp === myPrec && rightSide && ['-', '/', '%'].includes(ast.op))) return `(${s})`;
+          // Operators of equal precedence group left to right, so a right operand of equal precedence keeps its
+          // parentheses unless regrouping cannot change the value (a + (b + c), a * (b * c)).
+          if (cp < myPrec || (cp === myPrec && rightSide && !(child.op === ast.op && (ast.op === '+' || ast.op === '*')))) return `(${s})`;
           if (cp === myPrec && myPrec === 3) return `(${s})`; // chained comparisons
         }
         return s;

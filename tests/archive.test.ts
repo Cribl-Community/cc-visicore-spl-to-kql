@@ -26,7 +26,8 @@ describe('app package reader', () => {
     expect(k.macros.cim_Web_indexes).toBe('()');
     const r = translate('| tstats count from datamodel=Web.Web by Web.action', { knowledge: k, defaultDataset: 'main' });
     expect(r.kql).toContain('sourcetype=access_combined OR sourcetype=access_common');
-    expect(r.kql).toContain('| extend src = clientip, url = uri');
+    // tag=web can also return access_common events, so the access_combined aliases are limited to their sourcetype.
+    expect(r.kql).toContain('| extend src = iff(sourcetype == "access_combined", clientip, src), url = iff(sourcetype == "access_combined", uri, url)');
     expect(r.kql).toContain('| lookup output="status_description,status_type" http_status on status');
     expect(r.kql).toContain('| summarize count = count() by action');
     expect(r.unsupportedCount).toBe(0);

@@ -10,11 +10,11 @@
  */
 import { parseArgs, splitTopLevel, tokenize, type Tok } from './lexer';
 import { fieldRef, globToRegex, kqlRegexLiteral, kqlString, kqlVerbatim, translateExpr, parseExpr, renderExpr, ExprError } from './expr';
-import { type SAst, parseSearch, extractScope, renderScope, renderWhere, isEmptyPredicate, collectSourcetypes, partitionPredicate } from './search';
+import { type SAst, parseSearch, extractScope, renderScope, renderWhere, isEmptyPredicate, collectSourcetypes, partitionPredicate, requiredSourcetype } from './search';
 import { buildShim, matchSourcetypes } from '../knowledge/shim';
 import { calculationStages, constraintSearch, objectPrefixes, resolveDataModel } from '../knowledge/datamodel';
 import { parseSpan, spanToTimespan, spanToTimestats } from './time';
-import type { Ctx } from './types';
+import { createCtx, type Ctx } from './types';
 
 export interface HandlerResult {
   kql: string[];
@@ -33,6 +33,28 @@ export type Handler = (args: string, ctx: Ctx, env: Env) => HandlerResult;
 /* ------------------------------------------------------------------ */
 /* Small helpers                                                       */
 /* ------------------------------------------------------------------ */
+
+/** Splunk's current result order as KQL terms: newest first for raw events, null when Splunk defines none. */
+function splunkOrder(ctx: Ctx): string[] | null {
+  if (ctx.order === undefined) return ['_time desc'];
+  return ctx.order.length ? ctx.order : null;
+}
+
+const flipOrder = (terms: string[]) => terms.map((t) => (t.endsWith(' desc') ? t.replace(/ desc$/, ' asc') : t.replace(/ asc$/, ' desc')));
+const orderField = (term: string) => term.replace(/ (asc|desc)$/, '');
+
+/** `order by` that puts the Cribl rows in Splunk's current order, unless they already are. */
+function inSplunkOrder(ctx: Ctx): string[] {
+  const o = splunkOrder(ctx);
+  if (!o || ctx.orderApplied) return [];
+  ctx.orderApplied = true;
+  return [`order by ${o.join(', ')}`];
+}
+
+/** Cribl's order by keeps at most 10,000 rows (docs.cribl.io/search/order), whatever topN is set to. */
+function orderCapNote(ctx: Ctx, what: string): void {
+  ctx.note('warning', `${what}: Cribl Search's order by returns at most 10,000 rows, so rows beyond that are dropped before the later stages; Splunk keeps them all. Filter or aggregate first when this stage can see more than 10,000 rows.`);
+}
 
 const words = (s: string): string[] =>
   splitTopLevel(s, ' ')
@@ -106,6 +128,8 @@ export function buildScope(raw: string, ctx: Ctx): string[] {
   const k = ctx.opts.knowledge;
   const sourcetypes = k ? [...stSet].flatMap((st) => matchSourcetypes(st, k)) : [...stSet];
   for (const st of sourcetypes) ctx.sourcetypes.add(st);
+  // Report terms with no knowledge too, so the UI can say which sourcetypes are not covered.
+  if (k) for (const st of stSet) if (!matchSourcetypes(st, k).length) ctx.sourcetypes.add(st);
 
   let scope: string;
   if (datasets.length === 0) {
@@ -138,14 +162,21 @@ export function buildScope(raw: string, ctx: Ctx): string[] {
   // Field stages reproduced from Splunk knowledge (extractions, aliases, evals, lookups).
   const shim: string[] = [];
   if (k && ctx.opts.applyShim !== false) {
-    if (sourcetypes.length > 1) ctx.note('info', `Several sourcetypes are in scope (${sourcetypes.join(', ')}); their search-time field stages are applied in sequence.`);
-    const seen = new Set<string>();
+    // Splunk applies a sourcetype's knowledge only to that sourcetype's events. The stages can run
+    // unguarded only when the query pins exactly that one sourcetype; otherwise (several sourcetypes,
+    // wildcards, IN lists, OR branches, sourcetypes without knowledge) each rule set is limited to its
+    // own events. Sourcetypes with identical rules share one guard.
+    const dryCtx = () => Object.assign(createCtx(ctx.opts, ctx.inSubsearch), { fieldAliases: new Map(ctx.fieldAliases), dmPrefixes: ctx.dmPrefixes });
+    const body = (lines: string[]) => lines.filter((line) => !line.startsWith('//')).join('\n');
+    const groups = new Map<string, string[]>();
     for (const st of sourcetypes) {
-      const fresh = buildShim(st, k, ctx, { lookupToKql }).filter((line) => line.startsWith('//') || !seen.has(line));
-      fresh.forEach((line) => seen.add(line));
-      // Drop the header comment when every stage was already emitted for another sourcetype.
-      if (fresh.some((line) => !line.startsWith('//'))) shim.push(...fresh);
+      const b = body(buildShim(st, k, dryCtx(), { lookupToKql }));
+      if (b) groups.set(b, [...(groups.get(b) ?? []), st]);
     }
+    const pinned = requiredSourcetype(rest);
+    const guarded = !(sourcetypes.length === 1 && pinned === sourcetypes[0]);
+    if (guarded && groups.size) ctx.note('info', `Splunk applies search-time fields per sourcetype, and this query can return events of ${sourcetypes.length > 1 ? `several sourcetypes (${sourcetypes.join(', ')})` : `sourcetypes other than ${sourcetypes[0]}`}; each sourcetype's field stages are limited to its own events (sourcetype == "...").`);
+    for (const members of groups.values()) shim.push(...buildShim(members[0], k, ctx, { lookupToKql, guarded, guardSourcetypes: members }));
     if (!sourcetypes.length && stSet.size) ctx.note('info', `No Splunk knowledge is loaded for sourcetype ${[...stSet].join(', ')}; field names pass through unchanged.`);
   }
   // Predicates on extracted fields must run after the field stages exist.
@@ -299,11 +330,13 @@ export function aggToKql(a: Agg, ctx: Ctx): { kql: string; name: string } {
         break;
       case 'first':
         expr = `findlatest(${arg})`;
-        ctx.note('info', `first(${a.arg}) is the most recent value in Splunk (events arrive newest-first); emitted as findlatest(), which is order-independent.`);
+        if (ctx.order !== undefined) ctx.note('warning', `first(${a.arg}) returns the first value in the current result order in Splunk, which an earlier stage changed; findlatest() returns the most recent value instead.`);
+        else ctx.note('info', `first(${a.arg}) is the most recent value in Splunk (events arrive newest-first); emitted as findlatest(), which is order-independent.`);
         break;
       case 'last':
         expr = `findearliest(${arg})`;
-        ctx.note('info', `last(${a.arg}) is the oldest value in Splunk (events arrive newest-first); emitted as findearliest(), which is order-independent.`);
+        if (ctx.order !== undefined) ctx.note('warning', `last(${a.arg}) returns the last value in the current result order in Splunk, which an earlier stage changed; findearliest() returns the oldest value instead.`);
+        else ctx.note('info', `last(${a.arg}) is the oldest value in Splunk (events arrive newest-first); emitted as findearliest(), which is order-independent.`);
         break;
       case 'earliest':
         expr = `findearliest(${arg})`;
@@ -384,6 +417,7 @@ function statsLike(op: 'summarize' | 'eventstats'): Handler {
       ctx.note('info', 'Splunk stats drops events where a by-field is missing; a where isnotnull() stage was added to match. Remove it if the fields are always present.');
     }
     out.push(kql.trim());
+    if (op === 'summarize') ctx.order = by.length ? by.map((b) => `${b} asc`) : [];
     return { kql: out };
   };
 }
@@ -462,7 +496,8 @@ const rename: Handler = (args, ctx) => {
 };
 
 const sort: Handler = (args, ctx) => {
-  let limit = 0;
+  // Splunk: `sort <fields>` keeps 10,000 results, `sort 0`/`limit=0` keeps all, `sort N` keeps N.
+  let limit: number | undefined;
   const specs: string[] = [];
   let globalDesc = false;
   const ws = words(args);
@@ -497,8 +532,18 @@ const sort: Handler = (args, ctx) => {
     for (let i = 0; i < specs.length; i++) specs[i] = specs[i].endsWith(' asc') ? specs[i].replace(/ asc$/, ' desc') : specs[i].replace(/ desc$/, ' asc');
   }
   const kql: string[] = [];
-  if (specs.length) kql.push(`order by ${specs.join(', ')}`);
-  if (limit > 0) kql.push(`limit ${limit}`);
+  if (specs.length) {
+    // Splunk's sort is stable: rows that tie keep their incoming order. Cribl breaks ties arbitrarily,
+    // so the incoming order is appended as a tiebreaker.
+    const keys = new Set(specs.map(orderField));
+    const ties = (splunkOrder(ctx) ?? []).filter((t) => !keys.has(orderField(t)));
+    const full = [...specs, ...ties];
+    kql.push(`order by ${full.join(', ')}`);
+    ctx.order = full;
+    ctx.orderApplied = true;
+    if (limit === 0 || (limit ?? 0) > 10000) orderCapNote(ctx, `sort ${limit === 0 ? '0' : `limit=${limit}`}`);
+  }
+  if (limit !== undefined && limit > 0) kql.push(`limit ${limit}`);
   return { kql };
 };
 
@@ -509,21 +554,40 @@ const head: Handler = (args, ctx) => {
   if (pos.length === 1 && pos[0].t === 'word' && /^\d+$/.test(pos[0].v)) n = parseInt(pos[0].v, 10);
   else if (pos.length) {
     ctx.note('error', `head with a condition ("${args.trim()}") is not supported; Cribl Search limit takes a count. Emitted limit ${n} plus the condition as a where.`);
-    return { kql: [`where ${translateExpr(args, ctx)}`, `limit ${n}`] };
+    return { kql: [...inSplunkOrder(ctx), `where ${translateExpr(args, ctx)}`, `limit ${n}`] };
   }
-  return { kql: [`limit ${n}`] };
+  // Splunk keeps the first N results in the current order; Cribl's limit alone takes any N rows.
+  if (!splunkOrder(ctx)) ctx.note('info', `head ${n}: the earlier stages define no result order, so which ${n} rows are kept can differ from Splunk.`);
+  return { kql: [...inSplunkOrder(ctx), `limit ${n}`] };
 };
 
 const tail: Handler = (args, ctx) => {
   const m = /^\s*(\d+)?/.exec(args);
   const n = m && m[1] ? parseInt(m[1], 10) : 10;
-  ctx.note('info', 'tail returns the last N events; emitted as an ascending time sort followed by limit.');
-  return { kql: ['order by _time asc', `limit ${n}`] };
+  // Splunk returns the last N results of the current order, in reverse.
+  const o = splunkOrder(ctx);
+  if (!o) {
+    ctx.note('warning', `tail ${n}: the earlier stages define no result order, so the last ${n} rows cannot be reproduced; emitted as limit ${n}.`);
+    return { kql: [`limit ${n}`] };
+  }
+  const reversed = flipOrder(o);
+  ctx.note('info', `tail returns the last ${n} results in reverse order; emitted as order by ${reversed.join(', ')} followed by limit.`);
+  ctx.order = reversed;
+  ctx.orderApplied = true;
+  return { kql: [`order by ${reversed.join(', ')}`, `limit ${n}`] };
 };
 
 const reverse: Handler = (_args, ctx) => {
-  ctx.note('warning', 'reverse has no direct equivalent; add `| order by <field> asc` with the opposite direction of the previous sort.');
-  return { kql: [] };
+  const o = splunkOrder(ctx);
+  if (!o) {
+    ctx.note('warning', 'reverse: the earlier stages define no result order to reverse; add `| order by <field> asc|desc` explicitly.');
+    return { kql: [] };
+  }
+  const reversed = flipOrder(o);
+  ctx.order = reversed;
+  ctx.orderApplied = true;
+  orderCapNote(ctx, 'reverse');
+  return { kql: [`order by ${reversed.join(', ')}`] };
 };
 
 const topRare = (rare: boolean): Handler => (args, ctx) => {
@@ -556,11 +620,13 @@ const topRare = (rare: boolean): Handler => (args, ctx) => {
   const kql: string[] = [`summarize ${cf} = count() by ${[...by, ...f].join(', ')}`];
   if (showPerc) {
     kql.push(`eventstats __total = sum(${cf})${by.length ? ` by ${by.join(', ')}` : ''}`);
-    kql.push(`extend ${pf} = round(100.0 * ${cf} / __total, 2)`);
+    // Splunk reports percent with six decimals.
+    kql.push(`extend ${pf} = round(100.0 * ${cf} / __total, 6)`);
     kql.push('project-away __total');
   }
   if (by.length) {
     kql.push(`order by ${by.map((b) => `${b} asc`).join(', ')}, ${cf} ${dir}`);
+    ctx.order = [...by.map((b) => `${b} asc`), `${cf} ${dir}`];
     const restart = by.map((b) => `${b} != prev(${b})`).join(' or ');
     kql.push(`extend __rank = row_number(1, ${restart})`);
     kql.push(`where __rank <= ${n}`);
@@ -569,6 +635,8 @@ const topRare = (rare: boolean): Handler => (args, ctx) => {
   } else {
     kql.push(`order by ${cf} ${dir}`);
     kql.push(`limit ${n}`);
+    ctx.order = [`${cf} ${dir}`];
+    ctx.orderApplied = true;
   }
   return { kql };
 };
@@ -585,6 +653,9 @@ const streamstats: Handler = (args, ctx) => {
   if (p.opts.window) ctx.note('error', `streamstats window=${p.opts.window} (sliding windows) is not supported; the emitted expressions are cumulative.`);
   const aggs = parseAggList(h);
   const out: string[] = [];
+  // current=f helpers. Window functions misbehave when nested in iff() (restarts are skipped), so they get their own stage.
+  const pre: string[] = [];
+  let needRank = false;
   for (const a of aggs) {
     const name = fieldRef(a.alias ?? splDefaultName(a), ctx);
     if (!a.alias) ctx.fieldAliases.set(splDefaultName(a), sanitizeName(a.alias ?? (a.fn === 'count' && !a.arg ? 'count' : `${a.fn}_${a.arg}`)));
@@ -593,27 +664,65 @@ const streamstats: Handler = (args, ctx) => {
     switch (a.fn) {
       case 'count':
       case 'c':
-        out.push(`${nm} = row_number(1${restart})`);
+        if (arg) {
+          // count(field) counts only events that have the field.
+          const has = `iff(isnotnull(${arg}), 1, 0)`;
+          const tmp = `__ss_cnt${pre.length}`;
+          pre.push(`${tmp} = row_cumsum(${has}${restart})`);
+          out.push(currentFalse ? `${nm} = ${tmp} - ${has}` : `${nm} = ${tmp}`);
+        } else if (currentFalse) {
+          needRank = true;
+          out.push(`${nm} = __ss_rank - 1`);
+        } else out.push(`${nm} = row_number(1${restart})`);
         break;
       case 'sum':
-        out.push(`${nm} = row_cumsum(${arg}${restart})`);
+        if (currentFalse) {
+          // Running total of the preceding events only; Splunk leaves it empty on the first event of each group.
+          needRank = true;
+          const tmp = `__ss_sum${pre.length}`;
+          pre.push(`${tmp} = row_cumsum(${arg}${restart})`);
+          out.push(`${nm} = iff(__ss_rank == 1, int(null), ${tmp} - coalesce(${arg}, 0))`);
+        } else out.push(`${nm} = row_cumsum(${arg}${restart})`);
         break;
       case 'last':
-        if (currentFalse) out.push(`${nm} = prev(${arg})`);
+        if (currentFalse && by.length) {
+          // prev() would otherwise read across the group boundary.
+          needRank = true;
+          const tmp = `__ss_prev${pre.length}`;
+          pre.push(`${tmp} = prev(${arg})`);
+          out.push(`${nm} = iff(__ss_rank == 1, int(null), ${tmp})`);
+        } else if (currentFalse) out.push(`${nm} = prev(${arg})`);
         else out.push(`${nm} = ${arg}`);
         break;
       case 'first':
         ctx.note('error', `streamstats first(${a.arg}) is not supported (no running-first window function).`);
         break;
       default:
-        ctx.note('error', `streamstats ${a.fn}() is not supported; only count, sum and last (current=f) map to Cribl window functions.`);
+        ctx.note('error', `streamstats ${a.fn}() is not supported; only count, sum and last map to Cribl window functions.`);
     }
   }
   if (!out.length) return { kql: [todo(`streamstats ${args}`, 'streamstats')], unsupported: true };
-  // Splunk streams events newest-first; group restarts require the by-fields to be contiguous.
-  const order = [...by.map((b) => `${b} asc`), '_time desc'];
-  ctx.note('info', `Splunk streamstats runs over events newest-first${by.length ? ' and accumulates per group' : ''}; an order by stage was added to reproduce that. Flip _time to asc for chronological running totals.`);
-  return { kql: [`order by ${order.join(', ')}`, `extend ${out.join(', ')}`] };
+  // Splunk streamstats runs in the current result order and leaves that order unchanged. Group restarts need
+  // each group's rows to be contiguous, so grouped calculations sort by group, then restore the incoming order
+  // through a row ordinal.
+  const known = splunkOrder(ctx);
+  const base = known ?? ['_time desc'];
+  if (!known) ctx.note('warning', 'streamstats: the earlier stages define no result order; newest first (_time desc) was assumed.');
+  else ctx.note('info', `Splunk streamstats runs in the current result order (${base.join(', ')})${by.length ? ' and accumulates per group' : ''}; order by stages were added to reproduce that.`);
+  const lines: string[] = [];
+  if (!ctx.orderApplied || !known) lines.push(`order by ${base.join(', ')}`);
+  orderCapNote(ctx, 'streamstats');
+  if (by.length) {
+    lines.push('extend __ss_ord = row_number(1)', `order by ${[...by.map((b) => `${b} asc`), '__ss_ord asc'].join(', ')}`);
+  }
+  if (needRank) pre.unshift(`__ss_rank = row_number(1${restart})`);
+  if (pre.length) lines.push(`extend ${pre.join(', ')}`);
+  lines.push(`extend ${out.join(', ')}`);
+  const tmps = [...(by.length ? ['__ss_ord'] : []), ...pre.map((x) => x.split(' = ')[0])];
+  if (by.length) lines.push('order by __ss_ord asc');
+  if (tmps.length) lines.push(`project-away ${tmps.join(', ')}`);
+  ctx.orderApplied = true;
+  return { kql: lines };
 };
 
 const TIMECHART_OPTS = new Set(['span', 'bins', 'limit', 'useother', 'usenull', 'partial', 'cont', 'fixedrange', 'sep', 'format', 'minspan', 'otherstr', 'nullstr', 'agg']);
@@ -637,6 +746,7 @@ const timechart: Handler = (args, ctx) => {
   const kql = [`timestats ${spanKql}${aggs.map((a) => a.kql).join(', ')}${by.length ? ` by ${by.join(', ')}` : ''}`];
   if (by.length) ctx.note('info', 'timestats with a by-field returns one column per series, like Splunk timechart. Empty time buckets are omitted rather than zero-filled.');
   else ctx.note('info', 'timestats omits empty time buckets; Splunk timechart zero-fills them.');
+  ctx.order = ['_time asc'];
   return { kql };
 };
 
@@ -721,6 +831,14 @@ const dedup: Handler = (args, ctx) => {
     else fieldsSpl.push(unquote(t.v));
   });
   if (!fieldsSpl.length) return { kql: [todo(`dedup ${args}`, 'dedup')], unsupported: true };
+  const keys = fieldsSpl.map((f) => fieldRef(f, ctx));
+  const isTrue = (v?: string) => /^(t|true|1)$/i.test(v ?? '');
+  if (isTrue(p.opts.keepevents)) ctx.note('warning', 'dedup keepevents=t is not supported; duplicate events are removed.');
+  // Splunk sorts by `sortby` first, then keeps the first N results per key in that order over the whole
+  // result set; results missing a key field are dropped, or all kept with keepempty=t. Cribl's dedup operator
+  // only looks inside a time window, so rows are numbered per key instead: order, remember each row's
+  // position, group, keep the first N, then restore the order.
+  const changed = keys.map((k) => `${k} != prev(${k})`).join(' or ');
   const kql: string[] = [];
   if (sortby) {
     const specs = words(sortby).map((w) => {
@@ -728,11 +846,41 @@ const dedup: Handler = (args, ctx) => {
       const name = w.replace(/^[+-]/, '').replace(/^(ip|num|str|auto)\((.*)\)$/, '$2');
       return `${fieldRef(unquote(name), ctx)} ${desc ? 'desc' : 'asc'}`;
     });
-    kql.push(`order by ${specs.join(', ')}`);
+    // Ties keep the incoming order.
+    const sk = new Set(specs.map(orderField));
+    const full = [...specs, ...(splunkOrder(ctx) ?? []).filter((t) => !sk.has(orderField(t)))];
+    kql.push(`order by ${full.join(', ')}`);
+    ctx.order = full;
+    ctx.orderApplied = true;
+  } else kql.push(...inSplunkOrder(ctx));
+  orderCapNote(ctx, 'dedup');
+  const keepEmpty = isTrue(p.opts.keepempty);
+  const missing = keys.map((k) => `isnull(${k})`).join(' or ');
+  if (!keepEmpty) kql.push(`where ${keys.map((k) => `isnotnull(${k})`).join(' and ')}`);
+  const keep = keepEmpty ? `__dd_n <= ${n} or ${missing}` : `__dd_n <= ${n}`;
+  if (isTrue(p.opts.consecutive)) {
+    // Only runs of identical keys next to each other collapse.
+    // Window functions skip their restarts inside iff(), so the previous keys get their own stage.
+    const prevs = keys.map((k, i) => `__dd_prev${i} = prev(${k})`);
+    const starts = keys.map((k, i) => `isnull(__dd_prev${i}) or ${k} != __dd_prev${i}`).join(' or ');
+    kql.push(
+      `extend ${prevs.join(', ')}`,
+      `extend __dd_run = row_cumsum(iff(${starts}, 1, 0))`,
+      'extend __dd_n = row_number(1, __dd_run != prev(__dd_run))',
+      `where ${keep}`,
+      `project-away ${[...keys.map((_, i) => `__dd_prev${i}`), '__dd_run', '__dd_n'].join(', ')}`,
+    );
+  } else {
+    kql.push(
+      'extend __dd_ord = row_number(1)',
+      `order by ${[...keys.map((k) => `${k} asc`), '__dd_ord asc'].join(', ')}`,
+      `extend __dd_n = row_number(1, ${changed})`,
+      `where ${keep}`,
+      'order by __dd_ord asc',
+      'project-away __dd_ord, __dd_n',
+    );
   }
-  if (/^(t|true|1)$/i.test(p.opts.keepevents ?? '')) ctx.note('warning', 'dedup keepevents=t is not supported; duplicate events are removed.');
-  kql.push(`dedup ${n > 1 ? `num_duplicates=${n} ` : ''}by ${fieldsSpl.map((f) => fieldRef(f, ctx)).join(', ')}`);
-  ctx.note('warning', 'Cribl dedup only suppresses duplicates within a time window (default 30s). Add `time_window=<seconds>` covering your search range for Splunk-style global dedup.');
+  ctx.orderApplied = true;
   return { kql };
 };
 
@@ -801,11 +949,14 @@ const rex: Handler = (args, ctx) => {
     const out = groups.length === 1 ? fieldRef(groups[0].name, ctx) : fieldRef(sanitizeName(groups.map((g) => g.name).join('_')), ctx);
     return { kql: [`extend ${out} = extract_all(${kqlVerbatim(cleaned)}, ${src})`] };
   }
-  const parts = groups.map((g) => `${fieldRef(g.name, ctx)} = extract(${kqlVerbatim(cleaned)}, ${g.index}, ${src})`);
-  // extract() yields "" when the regex does not match; Splunk rex leaves the field unset.
-  const nulls = groups.map((g) => `${fieldRef(g.name, ctx)} = iff(isempty(${fieldRef(g.name, ctx)}), null, ${fieldRef(g.name, ctx)})`);
-  ctx.note('info', 'extract() returns an empty string when the regex does not match; a second extend converts those to null so later stats/where behave like Splunk.');
-  return { kql: [`extend ${parts.join(', ')}`, `extend ${nulls.join(', ')}`] };
+  // extract() yields "" when the regex does not match. Splunk rex then leaves the field as it was (unset,
+  // or its earlier value), so matches go to temporary fields first and only non-empty ones are copied.
+  // The temporaries also keep a group named like the source field from changing the input of later groups.
+  const tmp = (i: number) => `__rex${i}`;
+  const parts = groups.map((g, i) => `${tmp(i)} = extract(${kqlVerbatim(cleaned)}, ${g.index}, ${src})`);
+  const keep = groups.map((g, i) => `${fieldRef(g.name, ctx)} = iff(isempty(${tmp(i)}), ${fieldRef(g.name, ctx)}, ${tmp(i)})`);
+  ctx.note('info', 'extract() returns an empty string when the regex does not match; the extracted fields keep their previous value (or stay unset) in that case, like Splunk rex.');
+  return { kql: [`extend ${parts.join(', ')}`, `extend ${keep.join(', ')}`, `project-away ${groups.map((_, i) => tmp(i)).join(', ')}`] };
 };
 
 const regexCmd: Handler = (args, ctx) => {
@@ -899,8 +1050,10 @@ const outputlookup: Handler = (args, ctx) => {
   const table = unquote(t.v).replace(/\.csv$/i, '');
   ctx.lookups.add(table);
   const append = /^(t|true|1)$/i.test(p.opts.append ?? '');
+  // Splunk outputlookup replaces the lookup unless append=t. Cribl's export defaults to mode=create, which fails
+  // when the lookup exists, so the mode is always explicit.
   ctx.note('warning', `export to lookup ${append ? 'appends to' : 'replaces'} the lookup "${table}.csv" in Cribl Search when the query runs.`);
-  return { kql: [`export ${append ? 'mode=append ' : ''}to lookup ${/^[A-Za-z0-9_-]+$/.test(table) ? table : kqlString(table)}`] };
+  return { kql: [`export mode=${append ? 'append' : 'overwrite'} to lookup ${/^[A-Za-z0-9_-]+$/.test(table) ? table : kqlString(table)}`] };
 };
 
 const iplocation: Handler = (args, ctx) => {
@@ -1141,7 +1294,8 @@ const tstats: Handler = (args, ctx, env) => {
   if (dm && ctx.opts.knowledge) {
     const r = resolveDataModel(dm[1], ctx.opts.knowledge);
     if (r) {
-      const modelFields = new Set(r.chain.flatMap((o) => o.fields.map((f) => f.name)));
+      // Calculated fields (Eval/Rex/Lookup outputs such as Web.action) are model fields too.
+      const modelFields = new Set(r.chain.flatMap((o) => [...o.fields.map((f) => f.name), ...o.calculations.flatMap((c) => c.outputFields)]));
       for (const g of groups) {
         const bare = g.replace(/^[A-Za-z_][A-Za-z0-9_]*\./, '');
         if (bare !== '_time' && !modelFields.has(bare)) ctx.note('warning', `"${g}" is not a field of data model ${r.model.name}.${r.chain[r.chain.length - 1].name}; Splunk tstats would return no results for it. The field is grouped on anyway.`);
@@ -1177,8 +1331,10 @@ const delta: Handler = (args, ctx) => {
   if (toks[1] && toks[1].v.toLowerCase() === 'as' && toks[2]) out = unquote(toks[2].v);
   else ctx.fieldAliases.set(out, sanitizeName(`delta_${f}`));
   const n = p.opts.p ? parseInt(p.opts.p, 10) : 1;
-  ctx.note('info', 'delta uses prev(); make sure events are sorted (`| order by _time asc`) before this stage.');
-  return { kql: [`extend ${fieldRef(out, ctx)} = ${fieldRef(f, ctx)} - prev(${fieldRef(f, ctx)}${n !== 1 ? `, ${n}` : ''})`] };
+  // Splunk delta compares each result with the one before it in the current order.
+  const ordered = inSplunkOrder(ctx);
+  if (ordered.length) orderCapNote(ctx, 'delta');
+  return { kql: [...ordered, `extend ${fieldRef(out, ctx)} = ${fieldRef(f, ctx)} - prev(${fieldRef(f, ctx)}${n !== 1 ? `, ${n}` : ''})`] };
 };
 
 const accum: Handler = (args, ctx) => {
@@ -1186,7 +1342,10 @@ const accum: Handler = (args, ctx) => {
   if (!toks.length) return { kql: [todo(`accum ${args}`, 'accum')], unsupported: true };
   const f = unquote(toks[0]);
   const out = toks[1]?.toLowerCase() === 'as' && toks[2] ? unquote(toks[2]) : f;
-  return { kql: [`extend ${fieldRef(out, ctx)} = row_cumsum(${fieldRef(f, ctx)})`] };
+  // Splunk accum is a running total in the current result order.
+  const ordered = inSplunkOrder(ctx);
+  if (ordered.length) orderCapNote(ctx, 'accum');
+  return { kql: [...ordered, `extend ${fieldRef(out, ctx)} = row_cumsum(${fieldRef(f, ctx)})`] };
 };
 
 const collect: Handler = (args, ctx) => {
