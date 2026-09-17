@@ -1,0 +1,37 @@
+# Product API access declaration. Declare Cribl product API paths your app needs to access.
+# At install time, admins see exactly which platform resources the app will use.
+#
+# All Search endpoints are called under the default_search group (/m/default_search/...).
+
+policies:
+  # Datasets: map Splunk index= to Cribl Search datasets and warn about unknown names.
+  - object: '/m/:gid/search/datasets'
+    actions: ['GET']
+  # Lookups: validate lookup/inputlookup table names against uploaded lookup files.
+  - object: '/m/:gid/system/lookups'
+    actions: ['GET']
+  # Macros: validate `macro` references against Cribl Search macros.
+  - object: '/m/:gid/search/macros'
+    actions: ['GET']
+  # KQL documentation bundle (operators/functions) for the Reference panel.
+  - object: '/m/:gid/search/docs'
+    actions: ['GET']
+  # Syntax check: parse a query against sample events without running a search.
+  - object: '/m/:gid/search/preview'
+    actions: ['POST']
+  # Run the translated query as a search job (explicit user action only).
+  - object: '/m/:gid/search/jobs'
+    actions: ['POST']
+  - object: '/m/:gid/search/jobs/:id'
+    actions: ['GET']
+  - object: '/m/:gid/search/jobs/:id/results'
+    actions: ['GET']
+  - object: '/m/:gid/search/jobs/:id/logs'
+    actions: ['GET']
+  - object: '/m/:gid/search/jobs/:id/cancel'
+    actions: ['POST']
+  # Save the translated query as a Cribl Search saved search (explicit user action only).
+  - object: '/m/:gid/search/saved'
+    actions: ['POST']
+  - object: '/m/:gid/search/saved/:id'
+    actions: ['GET']
