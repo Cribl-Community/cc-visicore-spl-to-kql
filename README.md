@@ -290,7 +290,7 @@ This app is licensed under the Apache License 2.0.
 |---|---|
 | App Name | SPL to KQL |
 | App ID | cc-visicore-spl-to-kql |
-| Version | 1.2.0 |
+| Version | 1.3.0 |
 | Author | VisiCore (Andrew Hendrix) |
 | Support Model | community-built |
 | Support Label | Community Built |
